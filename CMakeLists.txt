@@ -69,8 +69,15 @@ add_executable(TensorMetalCompiler
   src/tensor/TensorIR.cpp
   src/backend/metal/MetalEmitter.hpp
   src/backend/metal/MetalEmitter.cpp
+  src/backend/metal/RMSNormBaseline.cpp
   src/backend/metal/MetalRuntime.hpp
   src/backend/metal/MetalRuntime.mm
+  src/validation/Validator.hpp
+  src/validation/Validator.cpp
+  src/benchmark/Benchmark.hpp
+  src/benchmark/Benchmark.cpp
+  src/planner/RMSNormTuner.hpp
+  src/planner/RMSNormTuner.cpp
 )
 
 target_include_directories(TensorMetalCompiler PRIVATE

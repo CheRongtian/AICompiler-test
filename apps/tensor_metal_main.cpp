@@ -1,13 +1,11 @@
 #include "backend/metal/MetalRuntime.hpp"
-#include "backend/metal/MetalEmitter.hpp"
+#include "planner/RMSNormTuner.hpp"
 #include "tensor/TensorIR.hpp"
+#include "validation/Validator.hpp"
 
-#include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <exception>
 #include <iostream>
-#include <limits>
 #include <string>
 #include <vector>
 
@@ -64,41 +62,16 @@ bool validateOutput(const tensor::metal::ExecutionResult &result,
   std::cout << "CPU submit-to-completion time (us): "
             << result.cpuSubmitToCompletionTimeUs << '\n';
 
-  if (result.output.size() != reference.size()) {
-    std::cerr << "Numerical validation: FAIL (unexpected output length)\n";
-    return false;
-  }
-
-  double maxAbsoluteError = 0.0;
-  std::size_t mismatchCount = 0;
-  std::size_t firstMismatch = reference.size();
-  for (std::size_t i = 0; i < reference.size(); ++i) {
-    const double actual = result.output[i];
-    const double expected = reference[i];
-    const bool finite = std::isfinite(actual) && std::isfinite(expected);
-    const double error = finite
-                            ? std::abs(actual - expected)
-                            : std::numeric_limits<double>::infinity();
-    maxAbsoluteError = std::max(maxAbsoluteError, error);
-    if (!finite || error > absoluteTolerance + relativeTolerance * std::abs(expected)) {
-      if (mismatchCount == 0) {
-        firstMismatch = i;
-      }
-      ++mismatchCount;
-    }
-  }
-
+  const auto validation = tensor::validation::compare(
+      result.output, reference, absoluteTolerance, relativeTolerance);
   std::cout << "Tolerance: atol=" << absoluteTolerance
             << ", rtol=" << relativeTolerance << '\n';
-  std::cout << "Max absolute error: " << maxAbsoluteError << '\n';
-  std::cout << "Numerical validation: " << passFail(mismatchCount == 0) << '\n';
-  if (mismatchCount != 0) {
-    std::cerr << "Mismatches: " << mismatchCount
-              << "; first index: " << firstMismatch
-              << "; expected: " << reference[firstMismatch]
-              << "; actual: " << result.output[firstMismatch] << '\n';
+  std::cout << "Max absolute error: " << validation.maxAbsoluteError << '\n';
+  std::cout << "Numerical validation: " << passFail(validation.passed) << '\n';
+  if (!validation.passed) {
+    std::cerr << "Validation error: " << validation.errorMessage << '\n';
   }
-  return mismatchCount == 0;
+  return validation.passed;
 }
 
 bool runVectorAddCase(const tensor::metal::MetalRuntime &runtime,
@@ -121,29 +94,6 @@ bool runVectorAddCase(const tensor::metal::MetalRuntime &runtime,
   return validateOutput(result, reference, 1e-6, 1e-6);
 }
 
-std::vector<double> rmsNormReference(const tensor::RMSNormOp &op,
-                                     const std::vector<float> &input,
-                                     const std::vector<float> &weight) {
-  const std::size_t width = op.input.shape.back();
-  const std::size_t rows = op.input.elementCount() / width;
-  std::vector<double> reference(input.size());
-  for (std::size_t row = 0; row < rows; ++row) {
-    double sumSquares = 0.0;
-    for (std::size_t column = 0; column < width; ++column) {
-      const double x = input[row * width + column];
-      sumSquares += x * x;
-    }
-    const double inverseRms =
-        1.0 / std::sqrt(sumSquares / static_cast<double>(width) + op.epsilon);
-    for (std::size_t column = 0; column < width; ++column) {
-      reference[row * width + column] =
-          static_cast<double>(input[row * width + column]) * inverseRms *
-          static_cast<double>(weight[column]);
-    }
-  }
-  return reference;
-}
-
 bool runRMSNormCase(tensor::metal::MetalRuntime &runtime,
                     std::size_t rows, std::size_t width) {
   const tensor::RMSNormOp op{
@@ -154,15 +104,6 @@ bool runRMSNormCase(tensor::metal::MetalRuntime &runtime,
 
   std::cout << "RMSNorm shape=[" << rows << ", " << width << "]"
             << ", dtype=fp32, epsilon=" << op.epsilon << '\n';
-  const auto kernel = tensor::metal::emitRMSNorm(op);
-  std::cout << "TensorIR -> MSL: PASS\n";
-  std::cout << "Threadgroups: " << kernel.threadgroupCount
-            << ", threads per threadgroup: " << kernel.threadsPerThreadgroup << '\n';
-  if (!printPipelineResult(runtime.createComputePipeline(kernel.source,
-                                                        kernel.functionName))) {
-    return false;
-  }
-
   std::vector<float> input(op.input.elementCount());
   std::vector<float> weight(op.weight.elementCount());
   for (std::size_t column = 0; column < width; ++column) {
@@ -177,12 +118,20 @@ bool runRMSNormCase(tensor::metal::MetalRuntime &runtime,
     }
   }
 
-  const auto reference = rmsNormReference(op, input, weight);
-  const auto result = runtime.run(
-      {{input.data(), input.size()}, {weight.data(), weight.size()}},
-      op.output.elementCount(),
-      {kernel.threadgroupCount, kernel.threadsPerThreadgroup});
-  return validateOutput(result, reference, 1e-5, 1e-4);
+  const auto result = tensor::planner::tuneRMSNorm(runtime, op, input, weight, std::cout);
+  if (!result.success) {
+    std::cerr << "RMSNorm tuning failed: " << result.errorMessage << '\n';
+    return false;
+  }
+  if (result.finalExecution.gpuExecutionTimeUs) {
+    std::cout << "Final GPU command buffer time (us): "
+              << *result.finalExecution.gpuExecutionTimeUs << '\n';
+  } else {
+    std::cout << "Final GPU command buffer time (us): Unavailable\n";
+  }
+  std::cout << "Final CPU submit-to-completion time (us): "
+            << result.finalExecution.cpuSubmitToCompletionTimeUs << '\n';
+  return true;
 }
 
 } // namespace

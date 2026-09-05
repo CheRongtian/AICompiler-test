@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace tensor::metal {
 namespace {
@@ -32,6 +33,81 @@ std::string errorMessage(NSError *error, const std::string &fallback) {
 }
 
 } // namespace
+
+class PreparedExecution::Impl {
+public:
+  id<MTLCommandQueue> queue = nil;
+  id<MTLComputePipelineState> pipeline = nil;
+  std::vector<id<MTLBuffer>> inputs;
+  id<MTLBuffer> output = nil;
+  std::size_t outputElementCount = 0;
+  DispatchSize dispatch;
+  std::vector<std::uint32_t> constants;
+
+  ExecutionResult execute(bool readback) const {
+    ExecutionResult result;
+    @autoreleasepool {
+      if (readback) {
+        std::fill_n(static_cast<float *>(output.contents), outputElementCount,
+                    std::numeric_limits<float>::quiet_NaN());
+      }
+      id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+      if (commandBuffer == nil) {
+        result.errorMessage = "Failed to create a Metal command buffer.";
+        return result;
+      }
+      id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+      if (encoder == nil) {
+        result.errorMessage = "Failed to create a Metal compute command encoder.";
+        return result;
+      }
+      [encoder setComputePipelineState:pipeline];
+      for (std::size_t index = 0; index < inputs.size(); ++index) {
+        [encoder setBuffer:inputs[index] offset:0 atIndex:index];
+      }
+      [encoder setBuffer:output offset:0 atIndex:inputs.size()];
+      if (!constants.empty()) {
+        [encoder setBytes:constants.data()
+                  length:constants.size() * sizeof(std::uint32_t)
+                 atIndex:inputs.size() + 1];
+      }
+      [encoder dispatchThreadgroups:MTLSizeMake(dispatch.threadgroupCount, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(dispatch.threadsPerThreadgroup, 1, 1)];
+      [encoder endEncoding];
+
+      const auto cpuStart = std::chrono::steady_clock::now();
+      [commandBuffer commit];
+      [commandBuffer waitUntilCompleted];
+      const auto cpuEnd = std::chrono::steady_clock::now();
+      result.cpuSubmitToCompletionTimeUs =
+          std::chrono::duration<double, std::micro>(cpuEnd - cpuStart).count();
+      if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
+        result.errorMessage = errorMessage(
+            commandBuffer.error, "Metal command buffer did not complete successfully.");
+        return result;
+      }
+      const double gpuStart = commandBuffer.GPUStartTime;
+      const double gpuEnd = commandBuffer.GPUEndTime;
+      if (std::isfinite(gpuStart) && std::isfinite(gpuEnd) &&
+          gpuStart > 0.0 && gpuEnd > gpuStart) {
+        result.gpuExecutionTimeUs = (gpuEnd - gpuStart) * 1e6;
+      }
+      if (readback) {
+        result.output.resize(outputElementCount);
+        std::memcpy(result.output.data(), output.contents,
+                    outputElementCount * sizeof(float));
+      }
+      result.executionPassed = true;
+    }
+    return result;
+  }
+};
+
+PreparedExecution::PreparedExecution(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+PreparedExecution::~PreparedExecution() = default;
+ExecutionResult PreparedExecution::run() const { return impl_->execute(true); }
+ExecutionResult PreparedExecution::measure() const { return impl_->execute(false); }
 
 class MetalRuntime::Impl {
 public:
@@ -62,6 +138,14 @@ public:
 
   [[nodiscard]] const std::string &initializationError() const noexcept {
     return initializationError_;
+  }
+
+  HardwareInfo hardwareInfo() const {
+    if (device_ == nil) {
+      return {};
+    }
+    return {device_.maxThreadsPerThreadgroup.width,
+            device_.maxThreadgroupMemoryLength, device_.maxBufferLength};
   }
 
   [[nodiscard]] ComputePipelineResult
@@ -118,8 +202,12 @@ public:
       result.kernelLookupPassed = true;
 
       NSError *pipelineError = nil;
+      MTLComputePipelineReflection *reflection = nil;
       id<MTLComputePipelineState> pipeline =
           [device_ newComputePipelineStateWithFunction:function
+                                               options:MTLPipelineOptionBindingInfo |
+                                                       MTLPipelineOptionBufferTypeInfo
+                                            reflection:&reflection
                                                  error:&pipelineError];
       if (pipeline == nil) {
         result.errorMessage = errorMessage(
@@ -131,17 +219,35 @@ public:
       result.threadExecutionWidth = pipeline.threadExecutionWidth;
       result.maxTotalThreadsPerThreadgroup =
           pipeline.maxTotalThreadsPerThreadgroup;
+      result.staticThreadgroupMemoryLength = pipeline.staticThreadgroupMemoryLength;
+      result.reflectionAvailable = reflection != nil;
+      for (id<MTLBinding> binding in reflection.bindings) {
+        if (!binding.isArgument || !binding.isUsed) {
+          continue;
+        }
+        PipelineBinding info;
+        info.index = binding.index;
+        info.isBuffer = binding.type == MTLBindingTypeBuffer;
+        info.readOnly = binding.access == MTLBindingAccessReadOnly;
+        info.writable = binding.access == MTLBindingAccessReadWrite ||
+                        binding.access == MTLBindingAccessWriteOnly;
+        if (info.isBuffer) {
+          id<MTLBufferBinding> buffer = (id<MTLBufferBinding>)binding;
+          info.isFloat32 = buffer.bufferDataType == MTLDataTypeFloat;
+        }
+        result.bindings.push_back(info);
+      }
       pipeline_ = pipeline;
     }
 
     return result;
   }
 
-  [[nodiscard]] ExecutionResult
-  run(const std::vector<FloatBufferView> &inputs,
+  [[nodiscard]] PreparationResult
+  prepare(const std::vector<FloatBufferView> &inputs,
       std::size_t outputElementCount, const DispatchSize &dispatch,
       const std::vector<std::uint32_t> &constants) const {
-    ExecutionResult result;
+    PreparationResult result;
 
     @autoreleasepool {
       if (!isAvailable()) {
@@ -180,8 +286,13 @@ public:
         }
       }
 
-      std::vector<id<MTLBuffer>> inputBuffers;
-      inputBuffers.reserve(inputs.size());
+      auto prepared = std::make_unique<PreparedExecution::Impl>();
+      prepared->queue = commandQueue_;
+      prepared->pipeline = pipeline_;
+      prepared->dispatch = dispatch;
+      prepared->constants = constants;
+      prepared->outputElementCount = outputElementCount;
+      prepared->inputs.reserve(inputs.size());
       for (const auto &input : inputs) {
         id<MTLBuffer> buffer =
             [device_ newBufferWithBytes:input.data
@@ -191,7 +302,7 @@ public:
           result.errorMessage = "Failed to allocate a shared input buffer.";
           return result;
         }
-        inputBuffers.push_back(buffer);
+        prepared->inputs.push_back(buffer);
       }
 
       const std::size_t byteCount = outputElementCount * sizeof(float);
@@ -203,61 +314,9 @@ public:
         return result;
       }
 
-      // Unwritten output elements must fail the numerical comparison.
-      std::fill_n(static_cast<float *>(outputBuffer.contents), outputElementCount,
-                  std::numeric_limits<float>::quiet_NaN());
-
-      id<MTLCommandBuffer> commandBuffer = [commandQueue_ commandBuffer];
-      if (commandBuffer == nil) {
-        result.errorMessage = "Failed to create a Metal command buffer.";
-        return result;
-      }
-      id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-      if (encoder == nil) {
-        result.errorMessage = "Failed to create a Metal compute command encoder.";
-        return result;
-      }
-
-      [encoder setComputePipelineState:pipeline_];
-      for (std::size_t index = 0; index < inputBuffers.size(); ++index) {
-        [encoder setBuffer:inputBuffers[index] offset:0 atIndex:index];
-      }
-      [encoder setBuffer:outputBuffer offset:0 atIndex:inputs.size()];
-      if (!constants.empty()) {
-        [encoder setBytes:constants.data()
-                  length:constants.size() * sizeof(std::uint32_t)
-                 atIndex:inputs.size() + 1];
-      }
-
-      [encoder dispatchThreadgroups:MTLSizeMake(dispatch.threadgroupCount, 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(dispatch.threadsPerThreadgroup, 1, 1)];
-      [encoder endEncoding];
-
-      const auto cpuStart = std::chrono::steady_clock::now();
-      [commandBuffer commit];
-      [commandBuffer waitUntilCompleted];
-      const auto cpuEnd = std::chrono::steady_clock::now();
-      result.cpuSubmitToCompletionTimeUs =
-          std::chrono::duration<double, std::micro>(cpuEnd - cpuStart).count();
-
-      if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
-        result.errorMessage = errorMessage(
-            commandBuffer.error, "Metal command buffer did not complete successfully.");
-        return result;
-      }
-
-      // Metal timestamps are in seconds and are read only after completion.
-      const double gpuStart = commandBuffer.GPUStartTime;
-      const double gpuEnd = commandBuffer.GPUEndTime;
-      if (std::isfinite(gpuStart) && std::isfinite(gpuEnd) &&
-          gpuStart > 0.0 && gpuEnd > gpuStart) {
-        result.gpuExecutionTimeUs = (gpuEnd - gpuStart) * 1e6;
-      }
-
-      // Shared storage is CPU-readable after GPU completion.
-      result.output.resize(outputElementCount);
-      std::memcpy(result.output.data(), outputBuffer.contents, byteCount);
-      result.executionPassed = true;
+      prepared->output = outputBuffer;
+      result.execution = std::unique_ptr<PreparedExecution>(
+          new PreparedExecution(std::move(prepared)));
     }
 
     return result;
@@ -290,6 +349,8 @@ std::string MetalRuntime::initializationError() const {
   return impl_->initializationError();
 }
 
+HardwareInfo MetalRuntime::hardwareInfo() const { return impl_->hardwareInfo(); }
+
 ComputePipelineResult
 MetalRuntime::createComputePipeline(const std::string &source,
                                     const std::string &functionName) {
@@ -300,7 +361,20 @@ ExecutionResult
 MetalRuntime::run(const std::vector<FloatBufferView> &inputs,
                   std::size_t outputElementCount, const DispatchSize &dispatch,
                   const std::vector<std::uint32_t> &constants) const {
-  return impl_->run(inputs, outputElementCount, dispatch, constants);
+  auto prepared = prepare(inputs, outputElementCount, dispatch, constants);
+  if (!prepared.execution) {
+    ExecutionResult result;
+    result.errorMessage = prepared.errorMessage;
+    return result;
+  }
+  return prepared.execution->run();
+}
+
+PreparationResult
+MetalRuntime::prepare(const std::vector<FloatBufferView> &inputs,
+                      std::size_t outputElementCount, const DispatchSize &dispatch,
+                      const std::vector<std::uint32_t> &constants) const {
+  return impl_->prepare(inputs, outputElementCount, dispatch, constants);
 }
 
 } // namespace tensor::metal

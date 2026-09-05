@@ -9,12 +9,30 @@
 
 namespace tensor::metal {
 
+struct HardwareInfo {
+  std::size_t maxThreadsPerThreadgroup = 0;
+  std::size_t maxThreadgroupMemoryLength = 0;
+  std::size_t maxBufferLength = 0;
+};
+
+struct PipelineBinding {
+  std::size_t index = 0;
+  bool isBuffer = false;
+  bool isFloat32 = false;
+  bool readOnly = false;
+  bool writable = false;
+};
+
 struct ComputePipelineResult {
   bool libraryCompilePassed = false;
   bool kernelLookupPassed = false;
   bool pipelineCreationPassed = false;
   std::size_t threadExecutionWidth = 0;
   std::size_t maxTotalThreadsPerThreadgroup = 0;
+  std::size_t staticThreadgroupMemoryLength = 0;
+  bool reflectionAvailable = false;
+  // Active argument bindings, translated from Metal reflection to C++ values.
+  std::vector<PipelineBinding> bindings;
   std::string errorMessage;
 };
 
@@ -39,6 +57,31 @@ struct ExecutionResult {
   std::string errorMessage;
 };
 
+// Owns a pipeline and its buffers independently of later runtime compilations.
+// Each submission creates a new command buffer; pipeline/buffers are reused.
+class PreparedExecution {
+public:
+  ~PreparedExecution();
+  PreparedExecution(const PreparedExecution &) = delete;
+  PreparedExecution &operator=(const PreparedExecution &) = delete;
+
+  // Reset output to NaNs, execute once and read output for numerical validation.
+  [[nodiscard]] ExecutionResult run() const;
+  // Execute once without CPU readback, for warmup and GPU timing samples.
+  [[nodiscard]] ExecutionResult measure() const;
+
+private:
+  friend class MetalRuntime;
+  class Impl;
+  explicit PreparedExecution(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+};
+
+struct PreparationResult {
+  std::unique_ptr<PreparedExecution> execution;
+  std::string errorMessage;
+};
+
 class MetalRuntime {
 public:
   MetalRuntime();
@@ -53,6 +96,7 @@ public:
   [[nodiscard]] bool isAvailable() const noexcept;
   [[nodiscard]] std::string deviceName() const;
   [[nodiscard]] std::string initializationError() const;
+  [[nodiscard]] HardwareInfo hardwareInfo() const;
 
   [[nodiscard]] ComputePipelineResult
   createComputePipeline(const std::string &source,
@@ -66,6 +110,11 @@ public:
   run(const std::vector<FloatBufferView> &inputs,
       std::size_t outputElementCount, const DispatchSize &dispatch,
       const std::vector<std::uint32_t> &constants = {}) const;
+
+  [[nodiscard]] PreparationResult
+  prepare(const std::vector<FloatBufferView> &inputs,
+          std::size_t outputElementCount, const DispatchSize &dispatch,
+          const std::vector<std::uint32_t> &constants = {}) const;
 
 private:
   class Impl;

@@ -1,3 +1,4 @@
+// Fixed V0b baseline. Keep its 256-thread algorithm independent of candidate edits.
 #include "backend/metal/MetalEmitter.hpp"
 
 #include <cstdint>
@@ -9,15 +10,11 @@
 
 namespace tensor::metal {
 
-GeneratedKernel emitRMSNorm(const RMSNormOp &op, std::size_t threadsPerThreadgroup) {
+GeneratedKernel emitRMSNormBaseline(const RMSNormOp &op) {
   op.validate();
   const std::size_t elementCount = op.input.elementCount();
   const std::size_t width = op.input.shape.back();
-  if (threadsPerThreadgroup != 64 && threadsPerThreadgroup != 128 &&
-      threadsPerThreadgroup != 256) {
-    throw std::invalid_argument("V1 RMSNorm supports 64, 128, or 256 threads.");
-  }
-  const std::size_t kThreads = threadsPerThreadgroup;
+  constexpr std::size_t kThreads = 256;
   if (elementCount > std::numeric_limits<std::uint32_t>::max()) {
     throw std::invalid_argument("Metal RMSNorm requires 32-bit tensor indices.");
   }

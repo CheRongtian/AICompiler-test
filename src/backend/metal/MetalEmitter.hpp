@@ -16,6 +16,10 @@ struct GeneratedKernel {
 
 // Buffer interface: 0 = input, 1 = weight, 2 = output (all fp32).
 // Shape and epsilon are specialized into the source. No runtime constants.
-[[nodiscard]] GeneratedKernel emitRMSNorm(const RMSNormOp &op);
+[[nodiscard]] GeneratedKernel emitRMSNorm(const RMSNormOp &op,
+                                        std::size_t threadsPerThreadgroup);
+
+// Frozen V0b algorithm, always 256 threads. Performance fallback for V1.
+[[nodiscard]] GeneratedKernel emitRMSNormBaseline(const RMSNormOp &op);
 
 } // namespace tensor::metal
