@@ -65,6 +65,10 @@ endif()
 
 add_executable(TensorMetalCompiler
   apps/tensor_metal_main.cpp
+  src/tensor/TensorIR.hpp
+  src/tensor/TensorIR.cpp
+  src/backend/metal/MetalEmitter.hpp
+  src/backend/metal/MetalEmitter.cpp
   src/backend/metal/MetalRuntime.hpp
   src/backend/metal/MetalRuntime.mm
 )
