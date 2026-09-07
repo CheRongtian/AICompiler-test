@@ -23,6 +23,7 @@ struct PipelineBinding {
   bool isFloat32 = false;
   bool isFloat16 = false;
   bool isInt32 = false;
+  bool isUInt32 = false;
   bool readOnly = false;
   bool writable = false;
 };

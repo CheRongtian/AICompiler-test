@@ -65,6 +65,8 @@ endif()
 
 add_executable(TensorMetalCompiler
   apps/tensor_metal_main.cpp
+  apps/generated_kernel_main.hpp
+  apps/generated_kernel_main.cpp
   apps/kv_cache_main.hpp
   apps/kv_cache_main.cpp
   apps/pytorch_import_main.hpp
@@ -85,6 +87,10 @@ add_executable(TensorMetalCompiler
   src/planner/KVCachePlan.cpp
   src/llm/AdvisorProtocol.hpp
   src/llm/AdvisorProtocol.cpp
+  src/llm/KernelContract.hpp
+  src/llm/KernelContract.cpp
+  src/llm/GeneratedKernelProtocol.hpp
+  src/llm/GeneratedKernelProtocol.mm
   src/backend/metal/MetalEmitter.hpp
   src/backend/metal/MetalEmitter.cpp
   src/backend/metal/GraphMetalEmitter.cpp
@@ -104,6 +110,8 @@ add_executable(TensorMetalCompiler
   src/runtime/KVCacheState.cpp
   src/runtime/StatefulExecutor.hpp
   src/runtime/StatefulExecutor.cpp
+  src/runtime/GeneratedKernelAdmission.hpp
+  src/runtime/GeneratedKernelAdmission.cpp
   src/importer/PyTorchImporter.hpp
   src/importer/PyTorchImporter.cpp
   src/importer/KVCacheImporter.hpp

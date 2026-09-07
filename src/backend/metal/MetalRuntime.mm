@@ -429,6 +429,7 @@ public:
           info.isFloat32 = buffer.bufferDataType == MTLDataTypeFloat;
           info.isFloat16 = buffer.bufferDataType == MTLDataTypeHalf;
           info.isInt32 = buffer.bufferDataType == MTLDataTypeInt;
+          info.isUInt32 = buffer.bufferDataType == MTLDataTypeUInt;
         }
         result.bindings.push_back(info);
       }

@@ -1,4 +1,5 @@
 #include "backend/metal/MetalRuntime.hpp"
+#include "generated_kernel_main.hpp"
 #include "kv_cache_main.hpp"
 #include "pytorch_import_main.hpp"
 #include "tensor_graph_examples.hpp"
@@ -123,12 +124,23 @@ int main(int argc, char **argv) {
     if (argc == 3 && std::string(argv[1]) == "--kv-cache") {
       return runKVCacheWorkload(runtime, argv[2], std::cout) ? 0 : 1;
     }
+    if (argc == 3 && std::string(argv[1]) == "--emit-kernel-contract") {
+      return emitGeneratedKernelContract(runtime, argv[2], std::cout) ? 0 : 1;
+    }
+    if (argc == 5 && std::string(argv[1]) == "--admit-generated-kernel" &&
+        std::string(argv[3]) == "--feedback-output") {
+      return runGeneratedKernelAdmission(runtime, argv[2], argv[4], std::cout)
+                 ? 0
+                 : 1;
+    }
     if (argc != 1) {
       std::cerr << "Usage: " << argv[0]
                 << " [--import-pytorch <graph-manifest>]"
                    " [--import-pytorch <graph-manifest> --emit-advisor-request <json>]"
                    " [--import-pytorch <graph-manifest> --advisor-response <json>]"
-                   " [--kv-cache <cache-manifest>]\n";
+                   " [--kv-cache <cache-manifest>]"
+                   " [--emit-kernel-contract <json>]"
+                   " [--admit-generated-kernel <json> --feedback-output <json>]\n";
       return 1;
     }
 

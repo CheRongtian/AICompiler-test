@@ -174,13 +174,13 @@ def main():
     parser.add_argument("--output", required=True, help="advisor response JSON")
     parser.add_argument(
         "--endpoint",
-        default=os.environ.get("TMC_LLM_ENDPOINT"),
+        default=os.environ.get("TMC_LLM_ADVISOR_URL"),
     )
     args = parser.parse_args()
 
     api_key = os.environ.get("TMC_LLM_API_KEY")
     if not args.endpoint:
-        raise AdvisorError("Set TMC_LLM_ENDPOINT or pass --endpoint.")
+        raise AdvisorError("Set TMC_LLM_ADVISOR_URL or pass --endpoint.")
     if not api_key:
         raise AdvisorError("Set TMC_LLM_API_KEY before calling the advisor.")
     request = _load_request(args.input)

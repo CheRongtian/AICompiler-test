@@ -5,6 +5,8 @@
 ```
 AICompiler/
 ├── apps/
+│   ├── generated_kernel_main.cpp
+│   ├── generated_kernel_main.hpp
 │   ├── main.cpp
 │   ├── kv_cache_main.cpp
 │   ├── kv_cache_main.hpp
@@ -30,13 +32,16 @@ AICompiler/
 │   │   ├── KVCacheImporter.*
 │   │   └── PyTorchImporter.*
 │   ├── llm/
-│   │   └── AdvisorProtocol.*
+│   │   ├── AdvisorProtocol.*
+│   │   ├── GeneratedKernelProtocol.*
+│   │   └── KernelContract.*
 │   ├── planner/
 │   │   ├── KernelPlan.*
 │   │   ├── KVCachePlan.*
 │   │   ├── RegionPlan.*
 │   │   └── RMSNormTuner.*
 │   ├── runtime/
+│   │   ├── GeneratedKernelAdmission.*
 │   │   ├── GraphExecutor.*
 │   │   ├── KVCacheState.*
 │   │   └── StatefulExecutor.*
@@ -60,10 +65,13 @@ AICompiler/
 ├── tools/
 │   ├── export_kv_cache.py
 │   ├── llm_advisor.py
+│   ├── llm_kernel_generator.py
 │   └── export_pytorch.py
 ├── prompts/
 │   ├── metal_advisor_en.md
-│   └── metal_advisor_zh.md
+│   ├── metal_advisor_zh.md
+│   ├── metal_kernel_generator_en.md
+│   └── metal_kernel_generator_zh.md
 ├── docs/papers/
 │   └── 2606.07665v2.pdf
 ├── tests/models/
@@ -157,7 +165,20 @@ cmake --build build --target TensorMetalCompiler
 - Retains hardware filtering, numerical validation, benchmarking, admission, and deterministic fallback inside the compiler.
 
 ```bash
-./run.sh
+./run.sh advisor
 ```
 
-Copy either prompt under `prompts/` into the remote Agent configuration, then fill `TMC_LLM_ENDPOINT` and `TMC_LLM_API_KEY` in the ignored project-local `.env` file. `run.sh` exports the Transformer workload, configures and builds the compiler, requests LLM advice, and executes advised compilation. The API client sends only the current compiler request JSON as a user message. API connectivity is external to the compiler; malformed or unavailable advice falls back to deterministic planning.
+Copy either Advisor prompt under `prompts/` into the remote Advisor Agent configuration, then fill `TMC_LLM_ADVISOR_URL` and the shared `TMC_LLM_API_KEY` in the ignored project-local `.env` file. `run.sh` exports the Transformer workload, configures and builds the compiler, requests LLM advice, and executes advised compilation. The API client sends only the current compiler request JSON as a user message. API connectivity is external to the compiler; malformed or unavailable advice falls back to deterministic planning.
+
+### LLM-generated Metal kernel admission
+
+- Emits a strict fp32 SiLU + Mul kernel contract for `[1, 4096]` and `[3, 4097]`.
+- Sends only the contract and subsequent compiler feedback to the separately configured remote kernel Agent.
+- Checks the generated function name, workgroup size, reflected Metal ABI, numerical output, and performance against the fastest measured template kernel.
+- Admits only candidates that reach 1.05x speedup in two paired rounds; otherwise retries up to three times and keeps the template fallback.
+
+```bash
+./run.sh generate
+```
+
+Copy `prompts/metal_kernel_generator_zh.md` or `prompts/metal_kernel_generator_en.md` into the remote Kernel Generator Agent, then fill `TMC_LLM_KERNEL_GENERATOR_URL` and the shared `TMC_LLM_API_KEY` in `.env`. Admitted source is stored under `build/generated_kernels/`; failed candidates remain outside the admitted artifact.
