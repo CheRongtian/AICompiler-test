@@ -106,7 +106,7 @@ GeneratedKernel emitKVCacheProjection(const planner::KVCachePlan &plan,
 }
 
 GeneratedKernel emitKVAttention(const planner::KVCachePlan &plan,
-                                std::size_t queryLength) {
+                                std::size_t queryLength, bool causalPrefill) {
   requireQueryLength(plan, queryLength);
   const auto dimension = plan.modelDimension();
   const auto workItems = plan.inputElementCount(queryLength);
@@ -127,7 +127,8 @@ GeneratedKernel emitKVAttention(const planner::KVCachePlan &plan,
          << "  uint gid [[thread_position_in_grid]]) {\n"
          << "  if (gid >= " << workItems << "u) return;\n"
          << "  const uint valid = uint(validLength[0]);\n"
-         << "  if (valid == 0u || valid > " << plan.capacity << "u) return;\n"
+         << "  if (valid < " << queryLength << "u || valid > "
+         << plan.capacity << "u) return;\n"
          << "  const uint feature = gid % " << dimension << "u;\n"
          << "  const uint queryPosition = (gid / " << dimension << "u) % "
          << queryLength << "u;\n"
@@ -137,8 +138,13 @@ GeneratedKernel emitKVAttention(const planner::KVCachePlan &plan,
          << "  const uint queryBase = ((batch * " << plan.heads
          << "u + head) * " << queryLength << "u + queryPosition) * "
          << plan.headDimension << "u;\n"
+         << "  const uint attended = "
+         << (causalPrefill ? "valid - " + std::to_string(queryLength) +
+                                 "u + queryPosition + 1u"
+                           : "valid")
+         << ";\n"
          << "  float maximum = -INFINITY;\n"
-         << "  for (uint position = 0; position < valid; ++position) {\n"
+         << "  for (uint position = 0; position < attended; ++position) {\n"
          << "    const uint keyBase = ((batch * " << plan.heads
          << "u + head) * " << plan.capacity << "u + position) * "
          << plan.headDimension << "u;\n"
@@ -151,7 +157,7 @@ GeneratedKernel emitKVAttention(const planner::KVCachePlan &plan,
          << "  }\n"
          << "  float denominator = 0.0f;\n"
          << "  float weighted = 0.0f;\n"
-         << "  for (uint position = 0; position < valid; ++position) {\n"
+         << "  for (uint position = 0; position < attended; ++position) {\n"
          << "    const uint cacheBase = ((batch * " << plan.heads
          << "u + head) * " << plan.capacity << "u + position) * "
          << plan.headDimension << "u;\n"

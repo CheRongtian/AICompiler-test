@@ -14,6 +14,8 @@ AICompiler/
 │   ├── pytorch_import_main.hpp
 │   ├── tensor_graph_examples.cpp
 │   ├── tensor_graph_examples.hpp
+│   ├── transformer_decode_main.cpp
+│   ├── transformer_decode_main.hpp
 │   └── tensor_metal_main.cpp
 ├── src/
 │   ├── analyzer/
@@ -25,12 +27,14 @@ AICompiler/
 │   │   ├── KVCacheMetalEmitter.*
 │   │   ├── MetalEmitter.*
 │   │   ├── MetalRuntime.*
-│   │   └── RMSNormBaseline.cpp
+│   │   ├── RMSNormBaseline.cpp
+│   │   └── TransformerDecodeMetalEmitter.*
 │   ├── benchmark/
 │   │   └── Benchmark.*
 │   ├── importer/
 │   │   ├── KVCacheImporter.*
-│   │   └── PyTorchImporter.*
+│   │   ├── PyTorchImporter.*
+│   │   └── TransformerDecodeImporter.*
 │   ├── llm/
 │   │   ├── AdvisorProtocol.*
 │   │   ├── GeneratedKernelProtocol.*
@@ -39,14 +43,17 @@ AICompiler/
 │   │   ├── KernelPlan.*
 │   │   ├── KVCachePlan.*
 │   │   ├── RegionPlan.*
-│   │   └── RMSNormTuner.*
+│   │   ├── RMSNormTuner.*
+│   │   └── TransformerDecodePlan.*
 │   ├── runtime/
 │   │   ├── GeneratedKernelAdmission.*
 │   │   ├── GraphExecutor.*
 │   │   ├── KVCacheState.*
-│   │   └── StatefulExecutor.*
+│   │   ├── StatefulExecutor.*
+│   │   └── TransformerDecodeExecutor.*
 │   ├── tensor/
-│   │   └── TensorIR.*
+│   │   ├── TensorIR.*
+│   │   └── TransformerDecode.hpp
 │   ├── validation/
 │   │   ├── GraphReference.*
 │   │   └── Validator.*
@@ -64,6 +71,7 @@ AICompiler/
 │   └── transformer_kv_benchmark.py
 ├── tools/
 │   ├── export_kv_cache.py
+│   ├── export_transformer_decode.py
 │   ├── llm_advisor.py
 │   ├── llm_kernel_generator.py
 │   └── export_pytorch.py
@@ -173,7 +181,7 @@ Copy either Advisor prompt under `prompts/` into the remote Advisor Agent config
 ### LLM-generated Metal kernel admission
 
 - Emits a strict fp32 SiLU + Mul kernel contract for `[1, 4096]` and `[3, 4097]`.
-- Sends only the contract and subsequent compiler feedback to the separately configured remote kernel Agent.
+- Sends the complete conversation history and repeats the immutable contract with compiler feedback on every retry.
 - Checks the generated function name, workgroup size, reflected Metal ABI, numerical output, and performance against the fastest measured template kernel.
 - Admits only candidates that reach 1.05x speedup in two paired rounds; otherwise retries up to three times and keeps the template fallback.
 
@@ -182,3 +190,18 @@ Copy either Advisor prompt under `prompts/` into the remote Advisor Agent config
 ```
 
 Copy `prompts/metal_kernel_generator_zh.md` or `prompts/metal_kernel_generator_en.md` into the remote Kernel Generator Agent, then fill `TMC_LLM_KERNEL_GENERATOR_URL` and the shared `TMC_LLM_API_KEY` in `.env`. Admitted source is stored under `build/generated_kernels/`; failed candidates remain outside the admitted artifact.
+
+### Stateful Transformer decode
+
+- Exports a two-layer cached decoder reference with external encoder memory using the existing PyTorch workload.
+- Compiles token embedding, positional encoding, cached causal self-attention, cross-attention, residual LayerNorm, ReLU FFN, LM head, and argmax into reusable Metal sequences.
+- Precomputes each layer's cross-attention memory K/V once and maintains independent fixed-capacity self-attention K/V buffers per layer.
+- Separates multi-token prefill from single-token decode, feeds each generated token into the next step, and keeps intermediate tensors on GPU buffers.
+- Validates logits, selected tokens, every layer's logical cache prefix, cache length, storage reuse, and safe capacity rejection against PyTorch references.
+- Reports prefill GPU time and median single-token decode GPU time.
+
+```bash
+./run.sh decode
+```
+
+This workload follows the current PyTorch model's sinusoidal positional encoding, LayerNorm, cross-attention, and ReLU FFN semantics. RoPE, RMSNorm, and gated MLP remain available for a later decoder-only LLM workload.

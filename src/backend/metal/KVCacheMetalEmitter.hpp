@@ -17,7 +17,7 @@ emitKVCacheProjection(const planner::KVCachePlan &plan,
 
 [[nodiscard]] GeneratedKernel
 emitKVAttention(const planner::KVCachePlan &plan,
-                std::size_t queryLength);
+                std::size_t queryLength, bool causalPrefill = false);
 
 [[nodiscard]] GeneratedKernel
 emitKVOutputProjection(const planner::KVCachePlan &plan,

@@ -73,6 +73,8 @@ add_executable(TensorMetalCompiler
   apps/pytorch_import_main.cpp
   apps/tensor_graph_examples.hpp
   apps/tensor_graph_examples.cpp
+  apps/transformer_decode_main.hpp
+  apps/transformer_decode_main.cpp
   src/tensor/TensorIR.hpp
   src/tensor/TensorIR.cpp
   src/analyzer/GraphAnalyzer.hpp
@@ -85,6 +87,8 @@ add_executable(TensorMetalCompiler
   src/planner/RegionPlan.cpp
   src/planner/KVCachePlan.hpp
   src/planner/KVCachePlan.cpp
+  src/planner/TransformerDecodePlan.hpp
+  src/planner/TransformerDecodePlan.cpp
   src/llm/AdvisorProtocol.hpp
   src/llm/AdvisorProtocol.cpp
   src/llm/KernelContract.hpp
@@ -97,6 +101,8 @@ add_executable(TensorMetalCompiler
   src/backend/metal/FusionMetalEmitter.cpp
   src/backend/metal/KVCacheMetalEmitter.hpp
   src/backend/metal/KVCacheMetalEmitter.cpp
+  src/backend/metal/TransformerDecodeMetalEmitter.hpp
+  src/backend/metal/TransformerDecodeMetalEmitter.cpp
   src/backend/metal/RMSNormBaseline.cpp
   src/backend/metal/MetalRuntime.hpp
   src/backend/metal/MetalRuntime.mm
@@ -112,10 +118,15 @@ add_executable(TensorMetalCompiler
   src/runtime/StatefulExecutor.cpp
   src/runtime/GeneratedKernelAdmission.hpp
   src/runtime/GeneratedKernelAdmission.cpp
+  src/runtime/TransformerDecodeExecutor.hpp
+  src/runtime/TransformerDecodeExecutor.cpp
   src/importer/PyTorchImporter.hpp
   src/importer/PyTorchImporter.cpp
   src/importer/KVCacheImporter.hpp
   src/importer/KVCacheImporter.cpp
+  src/importer/TransformerDecodeImporter.hpp
+  src/importer/TransformerDecodeImporter.cpp
+  src/tensor/TransformerDecode.hpp
   src/benchmark/Benchmark.hpp
   src/benchmark/Benchmark.cpp
   src/planner/RMSNormTuner.hpp

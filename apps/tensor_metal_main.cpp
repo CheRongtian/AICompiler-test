@@ -3,6 +3,7 @@
 #include "kv_cache_main.hpp"
 #include "pytorch_import_main.hpp"
 #include "tensor_graph_examples.hpp"
+#include "transformer_decode_main.hpp"
 #include "validation/Validator.hpp"
 
 #include <cstdint>
@@ -124,6 +125,9 @@ int main(int argc, char **argv) {
     if (argc == 3 && std::string(argv[1]) == "--kv-cache") {
       return runKVCacheWorkload(runtime, argv[2], std::cout) ? 0 : 1;
     }
+    if (argc == 3 && std::string(argv[1]) == "--transformer-decode") {
+      return runTransformerDecodeWorkload(runtime, argv[2], std::cout) ? 0 : 1;
+    }
     if (argc == 3 && std::string(argv[1]) == "--emit-kernel-contract") {
       return emitGeneratedKernelContract(runtime, argv[2], std::cout) ? 0 : 1;
     }
@@ -139,6 +143,7 @@ int main(int argc, char **argv) {
                    " [--import-pytorch <graph-manifest> --emit-advisor-request <json>]"
                    " [--import-pytorch <graph-manifest> --advisor-response <json>]"
                    " [--kv-cache <cache-manifest>]"
+                   " [--transformer-decode <decoder-manifest>]"
                    " [--emit-kernel-contract <json>]"
                    " [--admit-generated-kernel <json> --feedback-output <json>]\n";
       return 1;

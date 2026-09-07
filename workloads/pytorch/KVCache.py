@@ -66,8 +66,8 @@ class MultiHeadAttentionKVCache(nn.Module):
 
         # casual mask
         if mask is not None:
-            # mask is a bool matrix, in which True represents contents will be masked 
-            attn_scores = attn_scores.masked_fill(mask, 1e-9)
+            # A True entry is excluded from attention.
+            attn_scores = attn_scores.masked_fill(mask, float('-inf'))
 
         # softmax
         attn_weights = F.softmax(attn_scores, dim=-1)

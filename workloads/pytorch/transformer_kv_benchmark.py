@@ -67,7 +67,14 @@ class CachedDecoderLayer(nn.Module):
         self.cross_attn = MultiHeadAttention(d_model, n_heads, dropout)
         self.ffn = FeedFroward(d_model, d_ff, dropout)
 
-    def forward(self, tgt_step, memory, past_key_value=None, memory_mask=None):
+    def forward(
+        self,
+        tgt_step,
+        memory,
+        past_key_value=None,
+        self_mask=None,
+        memory_mask=None,
+    ):
         past_key = None
         past_value = None
         if past_key_value is not None:
@@ -79,6 +86,7 @@ class CachedDecoderLayer(nn.Module):
             tgt_step,
             past_key=past_key,
             past_value=past_value,
+            mask=self_mask,
         )
         out = self.self_attn_norm(tgt_step + self.self_attn_dropout(self_attn_out))
         out, _ = self.cross_attn(out, memory, memory, memory_mask)
@@ -104,7 +112,15 @@ class CachedDecoder(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         return pe.unsqueeze(0)
 
-    def forward_step(self, tgt_step, memory, layer_past_key_values=None, step=0, memory_mask=None):
+    def forward_step(
+        self,
+        tgt_step,
+        memory,
+        layer_past_key_values=None,
+        step=0,
+        self_mask=None,
+        memory_mask=None,
+    ):
         if layer_past_key_values is None:
             layer_past_key_values = [None] * len(self.layers)
 
@@ -113,7 +129,13 @@ class CachedDecoder(nn.Module):
 
         new_layer_past_key_values = []
         for layer, past_key_value in zip(self.layers, layer_past_key_values):
-            out, new_past_key_value = layer(out, memory, past_key_value, memory_mask)
+            out, new_past_key_value = layer(
+                out,
+                memory,
+                past_key_value,
+                self_mask=self_mask,
+                memory_mask=memory_mask,
+            )
             new_layer_past_key_values.append(new_past_key_value)
 
         return self.fc_out(out), new_layer_past_key_values
@@ -139,8 +161,23 @@ class TransformerWithKVCache(nn.Module):
     def encode(self, src, src_mask=None):
         return self.encoder(src, src_mask)
 
-    def decode_step(self, tgt_step, memory, layer_past_key_values=None, step=0, memory_mask=None):
-        return self.decoder.forward_step(tgt_step, memory, layer_past_key_values, step, memory_mask)
+    def decode_step(
+        self,
+        tgt_step,
+        memory,
+        layer_past_key_values=None,
+        step=0,
+        self_mask=None,
+        memory_mask=None,
+    ):
+        return self.decoder.forward_step(
+            tgt_step,
+            memory,
+            layer_past_key_values,
+            step,
+            self_mask,
+            memory_mask,
+        )
 
 
 @torch.no_grad()
