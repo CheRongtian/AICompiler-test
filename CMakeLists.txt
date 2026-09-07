@@ -65,6 +65,8 @@ endif()
 
 add_executable(TensorMetalCompiler
   apps/tensor_metal_main.cpp
+  apps/kv_cache_main.hpp
+  apps/kv_cache_main.cpp
   apps/pytorch_import_main.hpp
   apps/pytorch_import_main.cpp
   apps/tensor_graph_examples.hpp
@@ -79,10 +81,14 @@ add_executable(TensorMetalCompiler
   src/planner/KernelPlan.cpp
   src/planner/RegionPlan.hpp
   src/planner/RegionPlan.cpp
+  src/planner/KVCachePlan.hpp
+  src/planner/KVCachePlan.cpp
   src/backend/metal/MetalEmitter.hpp
   src/backend/metal/MetalEmitter.cpp
   src/backend/metal/GraphMetalEmitter.cpp
   src/backend/metal/FusionMetalEmitter.cpp
+  src/backend/metal/KVCacheMetalEmitter.hpp
+  src/backend/metal/KVCacheMetalEmitter.cpp
   src/backend/metal/RMSNormBaseline.cpp
   src/backend/metal/MetalRuntime.hpp
   src/backend/metal/MetalRuntime.mm
@@ -92,8 +98,14 @@ add_executable(TensorMetalCompiler
   src/validation/GraphReference.cpp
   src/runtime/GraphExecutor.hpp
   src/runtime/GraphExecutor.cpp
+  src/runtime/KVCacheState.hpp
+  src/runtime/KVCacheState.cpp
+  src/runtime/StatefulExecutor.hpp
+  src/runtime/StatefulExecutor.cpp
   src/importer/PyTorchImporter.hpp
   src/importer/PyTorchImporter.cpp
+  src/importer/KVCacheImporter.hpp
+  src/importer/KVCacheImporter.cpp
   src/benchmark/Benchmark.hpp
   src/benchmark/Benchmark.cpp
   src/planner/RMSNormTuner.hpp

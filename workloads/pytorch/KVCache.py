@@ -1,6 +1,3 @@
-from importlib_metadata import version
-# print("torch version: ", version("torch")) 2.8.0
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -85,6 +82,32 @@ class MultiHeadAttentionKVCache(nn.Module):
         # output mapping
         output = self.o_proj(attn_output)
         return output, past_key_values
+
+
+class KVCachePrefill(nn.Module):
+    """Export-friendly prefill entry with flat tensor outputs."""
+
+    def __init__(self, attention):
+        super().__init__()
+        self.attention = attention
+
+    def forward(self, q, k, v):
+        output, (key_cache, value_cache) = self.attention(q, k, v)
+        return output, key_cache, value_cache
+
+
+class KVCacheDecode(nn.Module):
+    """Export-friendly single-token decode entry retaining torch.cat as reference."""
+
+    def __init__(self, attention):
+        super().__init__()
+        self.attention = attention
+
+    def forward(self, q, k, v, past_key, past_value):
+        output, (key_cache, value_cache) = self.attention(
+            q, k, v, past_key=past_key, past_value=past_value
+        )
+        return output, key_cache, value_cache
 
 def calculate_kv_cache_size(past_key_values):
     # calculate past_key_values in memory (MB)

@@ -175,6 +175,10 @@ public:
   [[nodiscard]] BufferResult createBuffer(std::size_t elementCount,
                                           const float *initialData = nullptr,
                                           ElementType type = ElementType::Float32) const;
+  [[nodiscard]] std::string writeBuffer(const BufferHandle &buffer,
+                                        const float *data,
+                                        std::size_t elementCount,
+                                        std::size_t elementOffset = 0) const;
   [[nodiscard]] PreparationResult
   prepareBuffers(const std::vector<BufferHandle> &inputs, const BufferHandle &output,
                  const DispatchSize &dispatch,

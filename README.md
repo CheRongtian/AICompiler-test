@@ -6,6 +6,8 @@
 AICompiler/
 ├── apps/
 │   ├── main.cpp
+│   ├── kv_cache_main.cpp
+│   ├── kv_cache_main.hpp
 │   ├── pytorch_import_main.cpp
 │   ├── pytorch_import_main.hpp
 │   ├── tensor_graph_examples.cpp
@@ -18,19 +20,24 @@ AICompiler/
 │   ├── backend/metal/
 │   │   ├── FusionMetalEmitter.cpp
 │   │   ├── GraphMetalEmitter.cpp
+│   │   ├── KVCacheMetalEmitter.*
 │   │   ├── MetalEmitter.*
 │   │   ├── MetalRuntime.*
 │   │   └── RMSNormBaseline.cpp
 │   ├── benchmark/
 │   │   └── Benchmark.*
 │   ├── importer/
+│   │   ├── KVCacheImporter.*
 │   │   └── PyTorchImporter.*
 │   ├── planner/
 │   │   ├── KernelPlan.*
+│   │   ├── KVCachePlan.*
 │   │   ├── RegionPlan.*
 │   │   └── RMSNormTuner.*
 │   ├── runtime/
-│   │   └── GraphExecutor.*
+│   │   ├── GraphExecutor.*
+│   │   ├── KVCacheState.*
+│   │   └── StatefulExecutor.*
 │   ├── tensor/
 │   │   └── TensorIR.*
 │   ├── validation/
@@ -49,6 +56,7 @@ AICompiler/
 │   ├── MOE.py
 │   └── transformer_kv_benchmark.py
 ├── tools/
+│   ├── export_kv_cache.py
 │   └── export_pytorch.py
 ├── docs/papers/
 │   └── 2606.07665v2.pdf
@@ -118,3 +126,17 @@ maxTotalThreadsPerThreadgroup: 1024
 ./tests/test.sh
 ./tests/test.sh test_linear
 ./tests/test.sh test_mlp
+```
+
+### Stateful KV cache runtime
+
+- Traces explicit prefill and decode entries from `KVCache.py` and recognizes the two axis-2 `aten.cat` cache appends.
+- Lowers cache growth to fixed-capacity key/value Metal buffers with a runtime-managed valid length.
+- Compiles reusable prefill and single-token decode command sequences while preserving the stateless TensorGraph path.
+- Validates every output and logical cache prefix against the PyTorch reference, checks safe rejection at fixed-buffer capacity, and reports GPU latency.
+
+```bash
+python3 tools/export_kv_cache.py --output build/kv_cache.tmc
+cmake --build build --target TensorMetalCompiler
+./build/TensorMetalCompiler --kv-cache build/kv_cache.tmc
+```

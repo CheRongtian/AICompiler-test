@@ -1,4 +1,5 @@
 #include "backend/metal/MetalRuntime.hpp"
+#include "kv_cache_main.hpp"
 #include "pytorch_import_main.hpp"
 #include "tensor_graph_examples.hpp"
 #include "validation/Validator.hpp"
@@ -107,9 +108,13 @@ int main(int argc, char **argv) {
     if (argc == 3 && std::string(argv[1]) == "--import-pytorch") {
       return runImportedPyTorchGraph(runtime, argv[2], std::cout) ? 0 : 1;
     }
+    if (argc == 3 && std::string(argv[1]) == "--kv-cache") {
+      return runKVCacheWorkload(runtime, argv[2], std::cout) ? 0 : 1;
+    }
     if (argc != 1) {
       std::cerr << "Usage: " << argv[0]
-                << " [--import-pytorch <graph-manifest>]\n";
+                << " [--import-pytorch <graph-manifest>]"
+                   " [--kv-cache <cache-manifest>]\n";
       return 1;
     }
 

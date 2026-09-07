@@ -481,6 +481,33 @@ public:
     return result;
   }
 
+  std::string writeBuffer(const BufferHandle &buffer, const float *data,
+                          std::size_t count, std::size_t offset) const {
+    if (!isAvailable()) return initializationError_;
+    if (!buffer || buffer->impl_->buffer.device != device_) {
+      return "Buffer is missing or belongs to another Metal device.";
+    }
+    if (!data || count == 0 || offset > buffer->impl_->count ||
+        count > buffer->impl_->count - offset) {
+      return "Host update range is invalid for the Metal buffer.";
+    }
+    if (buffer->impl_->type == ElementType::Float32) {
+      auto *destination = static_cast<float *>(buffer->impl_->buffer.contents) + offset;
+      std::memcpy(destination, data, count * sizeof(float));
+    } else if (buffer->impl_->type == ElementType::Float16) {
+      auto *destination =
+          static_cast<std::uint16_t *>(buffer->impl_->buffer.contents) + offset;
+      for (std::size_t i = 0; i < count; ++i) destination[i] = floatToHalf(data[i]);
+    } else {
+      auto *destination =
+          static_cast<std::int32_t *>(buffer->impl_->buffer.contents) + offset;
+      for (std::size_t i = 0; i < count; ++i) {
+        destination[i] = static_cast<std::int32_t>(data[i]);
+      }
+    }
+    return {};
+  }
+
   PreparationResult prepareBuffers(const std::vector<BufferHandle> &inputs,
                                      const BufferHandle &output,
                                      const DispatchSize &dispatch,
@@ -611,6 +638,12 @@ BufferResult MetalRuntime::createBuffer(std::size_t elementCount,
                                         const float *initialData,
                                         ElementType type) const {
   return impl_->createBuffer(elementCount, initialData, type);
+}
+
+std::string MetalRuntime::writeBuffer(const BufferHandle &buffer, const float *data,
+                                      std::size_t elementCount,
+                                      std::size_t elementOffset) const {
+  return impl_->writeBuffer(buffer, data, elementCount, elementOffset);
 }
 
 PreparationResult MetalRuntime::prepareBuffers(const std::vector<BufferHandle> &inputs,
