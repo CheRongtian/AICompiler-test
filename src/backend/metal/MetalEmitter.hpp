@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <string>
 
+namespace tensor::planner { struct KernelPlan; }
+
 namespace tensor::metal {
 
 struct GeneratedKernel {
@@ -21,5 +23,7 @@ struct GeneratedKernel {
 
 // Frozen V0b algorithm, always 256 threads. Performance fallback for V1.
 [[nodiscard]] GeneratedKernel emitRMSNormBaseline(const RMSNormOp &op);
+
+[[nodiscard]] GeneratedKernel emitKernel(const planner::KernelPlan &plan);
 
 } // namespace tensor::metal

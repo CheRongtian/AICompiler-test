@@ -36,6 +36,31 @@ struct ComputePipelineResult {
   std::string errorMessage;
 };
 
+[[nodiscard]] std::string checkFloatBufferInterface(const ComputePipelineResult &pipeline,
+                                                    std::size_t inputCount);
+
+// Shared GPU storage, opaque to C++. read() requires completed GPU execution.
+class MetalBuffer {
+public:
+  ~MetalBuffer();
+  MetalBuffer(const MetalBuffer &) = delete;
+  MetalBuffer &operator=(const MetalBuffer &) = delete;
+  [[nodiscard]] std::size_t elementCount() const;
+  [[nodiscard]] std::vector<float> read() const;
+
+private:
+  friend class MetalRuntime;
+  class Impl;
+  explicit MetalBuffer(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+};
+
+using BufferHandle = std::shared_ptr<MetalBuffer>;
+struct BufferResult {
+  BufferHandle buffer;
+  std::string errorMessage;
+};
+
 // Borrowed CPU input; storage must remain valid throughout synchronous run().
 struct FloatBufferView {
   const float *data = nullptr;
@@ -67,8 +92,8 @@ public:
 
   // Reset output to NaNs, execute once and read output for numerical validation.
   [[nodiscard]] ExecutionResult run() const;
-  // Execute once without CPU readback, for warmup and GPU timing samples.
-  [[nodiscard]] ExecutionResult measure() const;
+  // Execute once without CPU readback, for graph nodes, warmup and timing samples.
+  [[nodiscard]] ExecutionResult execute() const;
 
 private:
   friend class MetalRuntime;
@@ -115,6 +140,13 @@ public:
   prepare(const std::vector<FloatBufferView> &inputs,
           std::size_t outputElementCount, const DispatchSize &dispatch,
           const std::vector<std::uint32_t> &constants = {}) const;
+
+  [[nodiscard]] BufferResult createBuffer(std::size_t elementCount,
+                                          const float *initialData = nullptr) const;
+  [[nodiscard]] PreparationResult
+  prepareBuffers(const std::vector<BufferHandle> &inputs, const BufferHandle &output,
+                 const DispatchSize &dispatch,
+                 const std::vector<std::uint32_t> &constants = {}) const;
 
 private:
   class Impl;

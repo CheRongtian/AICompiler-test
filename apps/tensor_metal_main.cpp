@@ -1,6 +1,5 @@
 #include "backend/metal/MetalRuntime.hpp"
-#include "planner/RMSNormTuner.hpp"
-#include "tensor/TensorIR.hpp"
+#include "tensor_graph_examples.hpp"
 #include "validation/Validator.hpp"
 
 #include <cstdint>
@@ -94,45 +93,6 @@ bool runVectorAddCase(const tensor::metal::MetalRuntime &runtime,
   return validateOutput(result, reference, 1e-6, 1e-6);
 }
 
-bool runRMSNormCase(tensor::metal::MetalRuntime &runtime,
-                    std::size_t rows, std::size_t width) {
-  const tensor::RMSNormOp op{
-      {{rows, width}, tensor::DType::Float32},
-      {{width}, tensor::DType::Float32},
-      {{rows, width}, tensor::DType::Float32},
-      1e-5f};
-
-  std::cout << "RMSNorm shape=[" << rows << ", " << width << "]"
-            << ", dtype=fp32, epsilon=" << op.epsilon << '\n';
-  std::vector<float> input(op.input.elementCount());
-  std::vector<float> weight(op.weight.elementCount());
-  for (std::size_t column = 0; column < width; ++column) {
-    weight[column] = 0.5f + static_cast<float>(column % 31) / 32.0f;
-  }
-  for (std::size_t row = 0; row < rows; ++row) {
-    // The multi-row case covers zero, epsilon-dominated, and ordinary inputs.
-    const float scale = rows == 1 ? 1.0f : (row == 0 ? 0.0f : (row == 1 ? 1e-4f : 1.0f));
-    for (std::size_t column = 0; column < width; ++column) {
-      const int centered = static_cast<int>((column * 17 + row * 13) % 257) - 128;
-      input[row * width + column] = static_cast<float>(centered) / 64.0f * scale;
-    }
-  }
-
-  const auto result = tensor::planner::tuneRMSNorm(runtime, op, input, weight, std::cout);
-  if (!result.success) {
-    std::cerr << "RMSNorm tuning failed: " << result.errorMessage << '\n';
-    return false;
-  }
-  if (result.finalExecution.gpuExecutionTimeUs) {
-    std::cout << "Final GPU command buffer time (us): "
-              << *result.finalExecution.gpuExecutionTimeUs << '\n';
-  } else {
-    std::cout << "Final GPU command buffer time (us): Unavailable\n";
-  }
-  std::cout << "Final CPU submit-to-completion time (us): "
-            << result.finalExecution.cpuSubmitToCompletionTimeUs << '\n';
-  return true;
-}
 
 } // namespace
 
@@ -150,9 +110,8 @@ int main() {
 
     const bool addAligned = runVectorAddCase(runtime, 4096, pipeline.threadExecutionWidth);
     const bool addTail = runVectorAddCase(runtime, 4097, pipeline.threadExecutionWidth);
-    const bool normAligned = runRMSNormCase(runtime, 1, 4096);
-    const bool normTail = runRMSNormCase(runtime, 3, 4097);
-    return addAligned && addTail && normAligned && normTail ? 0 : 1;
+    const bool graphsPassed = runTensorGraphExamples(runtime, std::cout);
+    return addAligned && addTail && graphsPassed ? 0 : 1;
   } catch (const std::exception &error) {
     std::cerr << "TensorMetalCompiler error: " << error.what() << '\n';
     return 1;

@@ -4,7 +4,6 @@
 #include "benchmark/Benchmark.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -46,21 +45,8 @@ std::string interfaceCheck(const RMSNormOp &op, const metal::GeneratedKernel &ke
                            const metal::ComputePipelineResult &pipeline,
                            const metal::HardwareInfo &hardware,
                            std::size_t expectedThreads) {
-  if (!pipeline.reflectionAvailable || pipeline.bindings.size() != 3) {
-    return "RMSNorm requires reflection with exactly three active buffer arguments.";
-  }
-  std::array<bool, 3> seen{};
-  for (const auto &binding : pipeline.bindings) {
-    if (!binding.isBuffer || !binding.isFloat32 || binding.index >= seen.size() ||
-        seen[binding.index]) {
-      return "RMSNorm interface must contain unique fp32 buffers at indices 0, 1, 2.";
-    }
-    seen[binding.index] = true;
-    if ((binding.index < 2 && !binding.readOnly) ||
-        (binding.index == 2 && !binding.writable)) {
-      return "RMSNorm requires read-only input/weight and a writable output.";
-    }
-  }
+  const auto bindingError = metal::checkFloatBufferInterface(pipeline, 2);
+  if (!bindingError.empty()) return bindingError;
   if (kernel.threadgroupCount != op.input.elementCount() / op.input.shape.back() ||
       kernel.threadsPerThreadgroup != expectedThreads ||
       expectedThreads > pipeline.maxTotalThreadsPerThreadgroup ||

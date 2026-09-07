@@ -18,7 +18,7 @@ Statistics summarize(std::vector<double> values) {
 
 std::string sample(const metal::PreparedExecution &execution,
                     std::vector<double> &values) {
-  const auto result = execution.measure();
+  const auto result = execution.execute();
   if (!result.executionPassed) {
     return "GPU execution failed: " + result.errorMessage;
   }
@@ -34,7 +34,7 @@ std::string sample(const metal::PreparedExecution &execution,
 
 std::string warmup(const metal::PreparedExecution &execution, std::size_t iterations) {
   for (std::size_t i = 0; i < iterations; ++i) {
-    const auto result = execution.measure();
+    const auto result = execution.execute();
     if (!result.executionPassed) {
       return result.errorMessage;
     }
