@@ -1,4 +1,5 @@
 #include "backend/metal/MetalRuntime.hpp"
+#include "pytorch_import_main.hpp"
 #include "tensor_graph_examples.hpp"
 #include "validation/Validator.hpp"
 
@@ -96,12 +97,21 @@ bool runVectorAddCase(const tensor::metal::MetalRuntime &runtime,
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   try {
     tensor::metal::MetalRuntime runtime;
     const std::string deviceName = runtime.deviceName();
     std::cout << "Metal device: "
               << (deviceName.empty() ? "Unavailable" : deviceName) << '\n';
+
+    if (argc == 3 && std::string(argv[1]) == "--import-pytorch") {
+      return runImportedPyTorchGraph(runtime, argv[2], std::cout) ? 0 : 1;
+    }
+    if (argc != 1) {
+      std::cerr << "Usage: " << argv[0]
+                << " [--import-pytorch <graph-manifest>]\n";
+      return 1;
+    }
 
     const auto pipeline = runtime.createComputePipeline(kVectorAddShader, "vector_add");
     if (!printPipelineResult(pipeline)) {

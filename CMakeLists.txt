@@ -65,6 +65,8 @@ endif()
 
 add_executable(TensorMetalCompiler
   apps/tensor_metal_main.cpp
+  apps/pytorch_import_main.hpp
+  apps/pytorch_import_main.cpp
   apps/tensor_graph_examples.hpp
   apps/tensor_graph_examples.cpp
   src/tensor/TensorIR.hpp
@@ -90,6 +92,8 @@ add_executable(TensorMetalCompiler
   src/validation/GraphReference.cpp
   src/runtime/GraphExecutor.hpp
   src/runtime/GraphExecutor.cpp
+  src/importer/PyTorchImporter.hpp
+  src/importer/PyTorchImporter.cpp
   src/benchmark/Benchmark.hpp
   src/benchmark/Benchmark.cpp
   src/planner/RMSNormTuner.hpp

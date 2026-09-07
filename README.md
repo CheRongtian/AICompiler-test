@@ -6,6 +6,8 @@
 AICompiler/
 ├── apps/
 │   ├── main.cpp
+│   ├── pytorch_import_main.cpp
+│   ├── pytorch_import_main.hpp
 │   ├── tensor_graph_examples.cpp
 │   ├── tensor_graph_examples.hpp
 │   └── tensor_metal_main.cpp
@@ -21,6 +23,8 @@ AICompiler/
 │   │   └── RMSNormBaseline.cpp
 │   ├── benchmark/
 │   │   └── Benchmark.*
+│   ├── importer/
+│   │   └── PyTorchImporter.*
 │   ├── planner/
 │   │   ├── KernelPlan.*
 │   │   ├── RegionPlan.*
@@ -44,8 +48,15 @@ AICompiler/
 │   ├── KVCache.py
 │   ├── MOE.py
 │   └── transformer_kv_benchmark.py
+├── tools/
+│   └── export_pytorch.py
 ├── docs/papers/
 │   └── 2606.07665v2.pdf
+├── tests/models/
+│   │     ├── test_linear.py
+│   │     ├── test_mlp.py
+│   │     └── test_model.py
+│   └── test.sh
 ├── CMakeLists.txt
 └── README.md
 ```
@@ -95,3 +106,15 @@ maxTotalThreadsPerThreadgroup: 1024
 - Forms regions with explicit external inputs and outputs and conservative alias/effect boundaries.
 - Generates fused candidates for Add + RMSNorm, Residual Add + LayerNorm, SiLU + Mul, and Linear + ReLU.
 - Compares fused candidates with an unfused same-command-buffer baseline and admits only candidates that pass numerical validation and the performance threshold.
+
+### Static PyTorch frontend
+
+- Uses `torch.export` to convert PyTorch models into the existing TensorIR.
+- Supports built-in workloads and custom test models through an `export_case()` interface.
+- Runs imported graphs through analysis, fusion/admission, Metal execution, and numerical validation against PyTorch.
+- Custom PyTorch tests are stored under `tests/models/` and can be executed with `tests/test.sh`.
+
+```bash
+./tests/test.sh
+./tests/test.sh test_linear
+./tests/test.sh test_mlp
