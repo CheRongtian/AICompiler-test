@@ -83,6 +83,8 @@ add_executable(TensorMetalCompiler
   src/planner/RegionPlan.cpp
   src/planner/KVCachePlan.hpp
   src/planner/KVCachePlan.cpp
+  src/llm/AdvisorProtocol.hpp
+  src/llm/AdvisorProtocol.cpp
   src/backend/metal/MetalEmitter.hpp
   src/backend/metal/MetalEmitter.cpp
   src/backend/metal/GraphMetalEmitter.cpp

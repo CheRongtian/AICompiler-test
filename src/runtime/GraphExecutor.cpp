@@ -199,6 +199,7 @@ struct AdmittedFusionCandidate {
 FusionSelection tuneRegion(metal::MetalRuntime &runtime, planner::RegionPlan &region,
                            const planner::GraphPlan &graph,
                            const validation::GraphReference &reference,
+                           const std::vector<std::size_t> &candidateThreads,
                            std::ostream &log) {
   FusionSelection selection;
   log << "Pattern detected: " << analyzer::fusionName(region.region.fusion) << '\n';
@@ -219,7 +220,7 @@ FusionSelection tuneRegion(metal::MetalRuntime &runtime, planner::RegionPlan &re
   if (!warmupError.empty()) throw std::runtime_error("Unfused region warmup failed: " + warmupError);
 
   std::vector<AdmittedFusionCandidate> admittedCandidates;
-  for (auto threads : region.candidateThreads) {
+  for (auto threads : candidateThreads) {
     log << "Fused candidate threads=" << threads << " | ";
     const auto hardware = runtime.hardwareInfo();
     const std::size_t scratchArrays =
@@ -339,7 +340,8 @@ GraphExecutionResult CompiledGraph::run() const {
 }
 
 GraphCompilation compileGraph(metal::MetalRuntime &runtime, const TensorGraph &graph,
-                              const GraphInputs &inputs, std::ostream &log) {
+                              const GraphInputs &inputs, std::ostream &log,
+                              const llm::AdvisorResponse *advisor) {
   GraphCompilation result;
   try {
     if (!runtime.isAvailable()) throw std::runtime_error(runtime.initializationError());
@@ -347,15 +349,26 @@ GraphCompilation compileGraph(metal::MetalRuntime &runtime, const TensorGraph &g
     log << "Graph analysis: PASS, nodes=" << graph.nodes.size()
         << ", regions=" << program.regions.size() << '\n';
     const auto reference = validation::evaluateGraph(program.graph.analyzed, inputs);
+    llm::AdvisorGuidance guidance;
+    if (advisor) {
+      const auto request = llm::makeAdvisorRequest(
+          program, runtime.deviceName(), runtime.hardwareInfo());
+      guidance = llm::makeAdvisorGuidance(request, *advisor, log);
+    }
 
-    for (auto &region : program.regions) {
+    for (std::size_t regionIndex = 0; regionIndex < program.regions.size();
+         ++regionIndex) {
+      auto &region = program.regions[regionIndex];
       for (auto &kernel : region.baseline) {
         if (kernel.op != OpType::RMSNorm) continue;
         const auto &attributes = std::get<RMSNormAttributes>(kernel.attributes);
         const RMSNormOp op{kernel.inputTypes[0], kernel.inputTypes[1], kernel.outputType,
                            attributes.epsilon};
+        const auto candidates = guidance.threadsFor(
+            region.region.id, llm::CandidateKind::RMSNorm, {64, 128, 256});
         auto tuned = planner::tuneRMSNorm(runtime, op,
-            reference.values[kernel.inputs[0]], reference.values[kernel.inputs[1]], log);
+            reference.values[kernel.inputs[0]], reference.values[kernel.inputs[1]],
+            candidates, log);
         if (!tuned.success) throw std::runtime_error(tuned.errorMessage);
         kernel.threadsPerThreadgroup = tuned.selectedThreads;
         kernel.useRMSNormBaseline = tuned.usedBaseline;
@@ -365,7 +378,11 @@ GraphCompilation compileGraph(metal::MetalRuntime &runtime, const TensorGraph &g
     std::vector<FusionSelection> selections(program.regions.size());
     for (std::size_t i = 0; i < program.regions.size(); ++i) {
       if (program.regions[i].region.fusion != analyzer::FusionPattern::None) {
-        selections[i] = tuneRegion(runtime, program.regions[i], program.graph, reference, log);
+        const auto candidates = guidance.threadsFor(
+            program.regions[i].region.id, llm::CandidateKind::Fusion,
+            program.regions[i].candidateThreads);
+        selections[i] = tuneRegion(runtime, program.regions[i], program.graph,
+                                   reference, candidates, log);
       }
     }
 

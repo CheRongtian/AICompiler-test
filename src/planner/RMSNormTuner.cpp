@@ -157,13 +157,20 @@ void printReport(const CandidateReport &report, std::ostream &log) {
 
 TuningResult tuneRMSNorm(metal::MetalRuntime &runtime, const RMSNormOp &op,
                          const std::vector<float> &input,
-                         const std::vector<float> &weight, std::ostream &log) {
+                         const std::vector<float> &weight,
+                         const std::vector<std::size_t> &candidateThreads,
+                         std::ostream &log) {
   TuningResult result;
   op.validate();
   const double loggedAbsolute = op.output.dtype == DType::Float16 ? 2e-3 : kAbsoluteTolerance;
   const double loggedRelative = op.output.dtype == DType::Float16 ? 2e-3 : kRelativeTolerance;
   const auto reference = validation::rmsNormReference(op, input, weight);
-  log << "Enumerate: threads={64, 128, 256}\n"
+  log << "Enumerate: threads={";
+  for (std::size_t index = 0; index < candidateThreads.size(); ++index) {
+    if (index != 0) log << ", ";
+    log << candidateThreads[index];
+  }
+  log << "}\n"
       << "CPU correctness baseline: double-accumulation reference\n"
       << "GPU performance baseline: fixed V0b 256-thread RMSNorm\n"
       << "Warmup=" << kWarmupIterations << ", samples=" << kSamples
@@ -203,7 +210,7 @@ TuningResult tuneRMSNorm(metal::MetalRuntime &runtime, const RMSNormOp &op,
   std::unique_ptr<metal::PreparedExecution> winner;
   std::size_t winnerIndex = 0;
   double bestSpeedup = 1.0;
-  for (const std::size_t threads : {64u, 128u, 256u}) {
+  for (const std::size_t threads : candidateThreads) {
     CandidateReport report;
     report.name = "candidate_" + std::to_string(threads);
     report.threads = threads;

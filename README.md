@@ -29,6 +29,8 @@ AICompiler/
 │   ├── importer/
 │   │   ├── KVCacheImporter.*
 │   │   └── PyTorchImporter.*
+│   ├── llm/
+│   │   └── AdvisorProtocol.*
 │   ├── planner/
 │   │   ├── KernelPlan.*
 │   │   ├── KVCachePlan.*
@@ -57,7 +59,11 @@ AICompiler/
 │   └── transformer_kv_benchmark.py
 ├── tools/
 │   ├── export_kv_cache.py
+│   ├── llm_advisor.py
 │   └── export_pytorch.py
+├── prompts/
+│   ├── metal_advisor_en.md
+│   └── metal_advisor_zh.md
 ├── docs/papers/
 │   └── 2606.07665v2.pdf
 ├── tests/models/
@@ -65,7 +71,9 @@ AICompiler/
 │   │     ├── test_mlp.py
 │   │     └── test_model.py
 │   └── test.sh
+├── .env.example
 ├── CMakeLists.txt
+├── run.sh
 └── README.md
 ```
 
@@ -140,3 +148,16 @@ python3 tools/export_kv_cache.py --output build/kv_cache.tmc
 cmake --build build --target TensorMetalCompiler
 ./build/TensorMetalCompiler --kv-cache build/kv_cache.tmc
 ```
+
+### LLM-guided candidate search
+
+- Exports static region, tensor, hardware, and legal-candidate summaries as JSON.
+- Lets an external LLM rank existing RMSNorm and fusion candidates without generating MSL.
+- Applies strict response parsing, candidate legality checks, and a two-candidate search budget per optimization kind.
+- Retains hardware filtering, numerical validation, benchmarking, admission, and deterministic fallback inside the compiler.
+
+```bash
+./run.sh
+```
+
+Copy either prompt under `prompts/` into the remote Agent configuration, then fill `TMC_LLM_ENDPOINT` and `TMC_LLM_API_KEY` in the ignored project-local `.env` file. `run.sh` exports the Transformer workload, configures and builds the compiler, requests LLM advice, and executes advised compilation. The API client sends only the current compiler request JSON as a user message. API connectivity is external to the compiler; malformed or unavailable advice falls back to deterministic planning.

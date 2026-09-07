@@ -40,6 +40,7 @@ struct TuningResult {
                                      const RMSNormOp &op,
                                      const std::vector<float> &input,
                                      const std::vector<float> &weight,
+                                     const std::vector<std::size_t> &candidateThreads,
                                      std::ostream &log);
 
 } // namespace tensor::planner

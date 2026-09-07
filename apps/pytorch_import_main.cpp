@@ -1,12 +1,16 @@
 #include "pytorch_import_main.hpp"
 
 #include "importer/PyTorchImporter.hpp"
+#include "llm/AdvisorProtocol.hpp"
+#include "planner/KernelPlan.hpp"
+#include "planner/RegionPlan.hpp"
 #include "runtime/GraphExecutor.hpp"
 #include "validation/Validator.hpp"
 
 #include <algorithm>
 #include <array>
 #include <iomanip>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -29,7 +33,8 @@ bool sameType(const tensor::TensorType &left, const tensor::TensorType &right) {
 
 bool runImportedPyTorchGraph(tensor::metal::MetalRuntime &runtime,
                              const std::string &manifestPath,
-                             std::ostream &log) {
+                             std::ostream &log,
+                             const PyTorchAdvisorOptions &advisor) {
   auto imported = tensor::importer::importPyTorchGraph(manifestPath);
   if (!imported.model) {
     log << "PyTorch import: FAIL\n"
@@ -51,8 +56,42 @@ bool runImportedPyTorchGraph(tensor::metal::MetalRuntime &runtime,
       << ", buffers=" << kindCounts[2]
       << ", constants=" << kindCounts[3] << '\n';
 
+  if (!advisor.requestOutputPath.empty()) {
+    auto program = tensor::planner::planRegions(tensor::planner::planGraph(
+        tensor::analyzer::analyze(imported.model->graph)));
+    const auto request = tensor::llm::makeAdvisorRequest(
+        std::move(program), runtime.deviceName(), runtime.hardwareInfo());
+    const auto error = tensor::llm::writeAdvisorRequest(
+        request, advisor.requestOutputPath);
+    if (!error.empty()) {
+      log << "Advisor request: FAIL\n"
+          << "Advisor error: " << error << '\n';
+      return false;
+    }
+    log << "Advisor request: PASS\n"
+        << "Advisor regions: " << request.program.regions.size() << '\n'
+        << "Advisor legal candidates: " << request.candidates.size() << '\n'
+        << "Advisor request file: " << advisor.requestOutputPath << '\n';
+    return true;
+  }
+
+  std::optional<tensor::llm::AdvisorResponse> response;
+  if (!advisor.responsePath.empty()) {
+    auto loaded = tensor::llm::loadAdvisorResponse(advisor.responsePath);
+    if (loaded.response) {
+      response = std::move(loaded.response);
+      log << "Advisor response parse: PASS\n";
+    } else {
+      log << "Advisor response parse: FAIL\n"
+          << "Advisor: FALLBACK\n"
+          << "Fallback reason: " << loaded.errorMessage << '\n'
+          << "Planner mode: deterministic fallback\n";
+    }
+  }
+
   auto compilation = tensor::runtime::compileGraph(
-      runtime, imported.model->graph, imported.model->inputs, log);
+      runtime, imported.model->graph, imported.model->inputs, log,
+      response ? &*response : nullptr);
   if (!compilation.executable) {
     log << "Imported graph compilation: FAIL\n"
         << "Compiler error: " << compilation.errorMessage << '\n';

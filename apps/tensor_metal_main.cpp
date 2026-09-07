@@ -108,12 +108,26 @@ int main(int argc, char **argv) {
     if (argc == 3 && std::string(argv[1]) == "--import-pytorch") {
       return runImportedPyTorchGraph(runtime, argv[2], std::cout) ? 0 : 1;
     }
+    if (argc == 5 && std::string(argv[1]) == "--import-pytorch" &&
+        std::string(argv[3]) == "--emit-advisor-request") {
+      PyTorchAdvisorOptions advisor;
+      advisor.requestOutputPath = argv[4];
+      return runImportedPyTorchGraph(runtime, argv[2], std::cout, advisor) ? 0 : 1;
+    }
+    if (argc == 5 && std::string(argv[1]) == "--import-pytorch" &&
+        std::string(argv[3]) == "--advisor-response") {
+      PyTorchAdvisorOptions advisor;
+      advisor.responsePath = argv[4];
+      return runImportedPyTorchGraph(runtime, argv[2], std::cout, advisor) ? 0 : 1;
+    }
     if (argc == 3 && std::string(argv[1]) == "--kv-cache") {
       return runKVCacheWorkload(runtime, argv[2], std::cout) ? 0 : 1;
     }
     if (argc != 1) {
       std::cerr << "Usage: " << argv[0]
                 << " [--import-pytorch <graph-manifest>]"
+                   " [--import-pytorch <graph-manifest> --emit-advisor-request <json>]"
+                   " [--import-pytorch <graph-manifest> --advisor-response <json>]"
                    " [--kv-cache <cache-manifest>]\n";
       return 1;
     }

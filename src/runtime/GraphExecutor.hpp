@@ -1,6 +1,7 @@
 #pragma once
 
 #include "backend/metal/MetalRuntime.hpp"
+#include "llm/AdvisorProtocol.hpp"
 #include "planner/RegionPlan.hpp"
 
 #include <iosfwd>
@@ -41,6 +42,7 @@ struct GraphCompilation {
 [[nodiscard]] GraphCompilation compileGraph(metal::MetalRuntime &runtime,
                                             const TensorGraph &graph,
                                             const GraphInputs &inputs,
-                                            std::ostream &log);
+                                            std::ostream &log,
+                                            const llm::AdvisorResponse *advisor = nullptr);
 
 } // namespace tensor::runtime
