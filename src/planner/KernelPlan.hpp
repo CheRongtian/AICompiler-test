@@ -21,7 +21,10 @@ enum class BufferRole { Input, Intermediate, Output };
 struct BufferPlan {
   ValueId value = 0;
   std::size_t elementCount = 0;
+  std::size_t storageElementCount = 0;
+  TensorType type;
   BufferRole role = BufferRole::Intermediate;
+  std::optional<ValueId> aliasOf;
 };
 
 struct GraphPlan {

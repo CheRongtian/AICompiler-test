@@ -71,11 +71,16 @@ add_executable(TensorMetalCompiler
   src/tensor/TensorIR.cpp
   src/analyzer/GraphAnalyzer.hpp
   src/analyzer/GraphAnalyzer.cpp
+  src/analyzer/PatternAnalyzer.hpp
+  src/analyzer/PatternAnalyzer.cpp
   src/planner/KernelPlan.hpp
   src/planner/KernelPlan.cpp
+  src/planner/RegionPlan.hpp
+  src/planner/RegionPlan.cpp
   src/backend/metal/MetalEmitter.hpp
   src/backend/metal/MetalEmitter.cpp
   src/backend/metal/GraphMetalEmitter.cpp
+  src/backend/metal/FusionMetalEmitter.cpp
   src/backend/metal/RMSNormBaseline.cpp
   src/backend/metal/MetalRuntime.hpp
   src/backend/metal/MetalRuntime.mm

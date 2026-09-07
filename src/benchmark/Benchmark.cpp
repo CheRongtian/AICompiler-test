@@ -16,8 +16,8 @@ Statistics summarize(std::vector<double> values) {
   return {count, median, values.front(), values.back()};
 }
 
-std::string sample(const metal::PreparedExecution &execution,
-                    std::vector<double> &values) {
+template <typename Execution>
+std::string sample(const Execution &execution, std::vector<double> &values) {
   const auto result = execution.execute();
   if (!result.executionPassed) {
     return "GPU execution failed: " + result.errorMessage;
@@ -30,19 +30,17 @@ std::string sample(const metal::PreparedExecution &execution,
   return {};
 }
 
-} // namespace
-
-std::string warmup(const metal::PreparedExecution &execution, std::size_t iterations) {
+template <typename Execution>
+std::string warmupImpl(const Execution &execution, std::size_t iterations) {
   for (std::size_t i = 0; i < iterations; ++i) {
     const auto result = execution.execute();
-    if (!result.executionPassed) {
-      return result.errorMessage;
-    }
+    if (!result.executionPassed) return result.errorMessage;
   }
   return {};
 }
 
-Result measure(const metal::PreparedExecution &execution, std::size_t samples) {
+template <typename Execution>
+Result measureImpl(const Execution &execution, std::size_t samples) {
   Result result;
   if (samples == 0) {
     result.errorMessage = "Benchmark requires at least one sample.";
@@ -52,18 +50,16 @@ Result measure(const metal::PreparedExecution &execution, std::size_t samples) {
   values.reserve(samples);
   for (std::size_t i = 0; i < samples; ++i) {
     result.errorMessage = sample(execution, values);
-    if (!result.errorMessage.empty()) {
-      return result;
-    }
+    if (!result.errorMessage.empty()) return result;
   }
   result.stats = summarize(values);
   result.passed = true;
   return result;
 }
 
-PairedResult measurePair(const metal::PreparedExecution &baseline,
-                         const metal::PreparedExecution &candidate,
-                         std::size_t samples) {
+template <typename Execution>
+PairedResult measurePairImpl(const Execution &baseline, const Execution &candidate,
+                             std::size_t samples) {
   PairedResult result;
   if (samples == 0) {
     result.errorMessage = "Benchmark requires at least one sample.";
@@ -89,6 +85,36 @@ PairedResult measurePair(const metal::PreparedExecution &baseline,
   result.speedup = result.baseline.medianUs / result.candidate.medianUs;
   result.passed = true;
   return result;
+}
+
+} // namespace
+
+std::string warmup(const metal::PreparedExecution &execution, std::size_t iterations) {
+  return warmupImpl(execution, iterations);
+}
+
+Result measure(const metal::PreparedExecution &execution, std::size_t samples) {
+  return measureImpl(execution, samples);
+}
+
+PairedResult measurePair(const metal::PreparedExecution &baseline,
+                         const metal::PreparedExecution &candidate,
+                         std::size_t samples) {
+  return measurePairImpl(baseline, candidate, samples);
+}
+
+std::string warmup(const metal::PreparedSequence &execution, std::size_t iterations) {
+  return warmupImpl(execution, iterations);
+}
+
+Result measure(const metal::PreparedSequence &execution, std::size_t samples) {
+  return measureImpl(execution, samples);
+}
+
+PairedResult measurePair(const metal::PreparedSequence &baseline,
+                         const metal::PreparedSequence &candidate,
+                         std::size_t samples) {
+  return measurePairImpl(baseline, candidate, samples);
 }
 
 } // namespace tensor::benchmark

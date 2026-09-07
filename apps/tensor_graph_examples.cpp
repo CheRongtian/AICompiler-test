@@ -1,11 +1,14 @@
 #include "tensor_graph_examples.hpp"
 
+#include "analyzer/PatternAnalyzer.hpp"
 #include "runtime/GraphExecutor.hpp"
 #include "validation/Validator.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -54,8 +57,10 @@ bool runCase(metal::MetalRuntime &runtime, const std::string &name,
   }
   bool passed = true;
   for (std::size_t i = 0; i < executed.outputs.size(); ++i) {
-    const auto comparison = tensor::validation::compare(executed.outputs[i], compiled.referenceOutputs[i],
-                                                         1e-5, 1e-4);
+    const bool half = compiled.outputTypes[i].dtype == DType::Float16;
+    const auto comparison = tensor::validation::compare(
+        executed.outputs[i], compiled.referenceOutputs[i],
+        half ? 2e-3 : 1e-5, half ? 2e-3 : 1e-4);
     log << "Output " << graph.values[graph.outputs[i]].name << " shape=[";
     for (std::size_t axis = 0; axis < expectedShapes[i].size(); ++axis) {
       if (axis != 0) log << ", ";
@@ -72,11 +77,12 @@ bool runCase(metal::MetalRuntime &runtime, const std::string &name,
 }
 
 bool runRMSGraph(metal::MetalRuntime &runtime, std::size_t rows, std::size_t width,
-                  bool residual, std::ostream &log) {
+                 bool residual, std::ostream &log,
+                 DType dtype = DType::Float32) {
   TensorGraph graph;
   GraphInputs inputs;
-  const TensorType inputType{{rows, width}};
-  const TensorType weightType{{width}};
+  const TensorType inputType{{rows, width}, dtype};
+  const TensorType weightType{{width}, dtype};
   const auto x = graph.addInput("x", inputType);
   const auto weight = graph.addInput("weight", weightType);
   inputs[x] = data(inputType);
@@ -99,8 +105,78 @@ bool runRMSGraph(metal::MetalRuntime &runtime, std::size_t rows, std::size_t wid
   }
   const auto output = graph.addNode(OpType::RMSNorm, {normInput, weight}, RMSNormAttributes{});
   graph.outputs = {output};
-  return runCase(runtime, residual ? "Add -> RMSNorm" : "RMSNorm (V1 autotuning)",
+  const std::string name = residual ? "Add -> RMSNorm"
+      : dtype == DType::Float16 ? "fp16 RMSNorm with fp32 accumulation"
+                                : "RMSNorm autotuning";
+  return runCase(runtime, name,
                   graph, inputs, {{rows, width}}, log);
+}
+
+bool runLayerNormFusion(metal::MetalRuntime &runtime, std::ostream &log) {
+  TensorGraph graph;
+  const TensorType xType{{3, 17}}, parameterType{{17}};
+  const auto x = graph.addInput("x", xType);
+  const auto residual = graph.addInput("residual", parameterType);
+  const auto weight = graph.addInput("weight", parameterType);
+  const auto bias = graph.addInput("bias", parameterType);
+  const auto added = graph.addNode(OpType::Add, {x, residual});
+  graph.outputs = {graph.addNode(OpType::LayerNorm, {added, weight, bias},
+                                 LayerNormAttributes{})};
+  auto weights = data(parameterType, 3, 0.2f);
+  for (auto &value : weights) value += 1.0f;
+  return runCase(runtime, "Residual Add -> LayerNorm", graph,
+      {{x, data(xType)}, {residual, data(parameterType, 1, 0.1f)},
+       {weight, std::move(weights)}, {bias, data(parameterType, 2, 0.05f)}},
+      {{3, 17}}, log);
+}
+
+bool runLinearReLUFusion(metal::MetalRuntime &runtime, std::ostream &log) {
+  TensorGraph graph;
+  const TensorType inputType{{3, 7}}, weightType{{7, 5}}, biasType{{5}};
+  const auto input = graph.addInput("input", inputType);
+  const auto weight = graph.addInput("weight", weightType);
+  const auto bias = graph.addInput("bias", biasType);
+  const auto linear = graph.addNode(OpType::MatMul, {input, weight});
+  const auto biased = graph.addNode(OpType::Add, {linear, bias});
+  graph.outputs = {graph.addNode(OpType::ReLU, {biased})};
+  return runCase(runtime, "Linear -> ReLU", graph,
+      {{input, data(inputType)}, {weight, data(weightType, 1, 0.25f)},
+       {bias, data(biasType, 2, 0.1f)}}, {{3, 5}}, log);
+}
+
+bool runViewAndReduction(metal::MetalRuntime &runtime, std::ostream &log) {
+  TensorGraph graph;
+  const TensorType inputType{{2, 3, 4}};
+  const auto input = graph.addInput("input", inputType);
+  const auto transposed = graph.addNode(OpType::Transpose, {input},
+                                        TransposeAttributes{1, 2});
+  const auto contiguous = graph.addNode(OpType::Contiguous, {transposed});
+  const auto probabilities = graph.addNode(OpType::Softmax, {contiguous},
+                                            SoftmaxAttributes{-1});
+  graph.outputs = {graph.addNode(OpType::ReduceMean, {probabilities},
+                                 ReductionAttributes{{0, 2}, false})};
+  return runCase(runtime, "Transpose -> Contiguous -> Softmax -> ReduceMean",
+                 graph, {{input, data(inputType)}}, {{4}}, log);
+}
+
+bool checkFusionBoundary(std::ostream &log) {
+  TensorGraph graph;
+  const TensorType xType{{2, 17}}, parameterType{{17}};
+  const auto x = graph.addInput("x", xType);
+  const auto residual = graph.addInput("residual", parameterType);
+  const auto weight = graph.addInput("weight", parameterType);
+  const auto added = graph.addNode(OpType::Add, {x, residual});
+  const auto normalized = graph.addNode(OpType::RMSNorm, {added, weight},
+                                         RMSNormAttributes{});
+  graph.outputs = {added, normalized};
+  const auto regions = tensor::analyzer::formRegions(tensor::analyzer::analyze(graph));
+  const bool passed = std::none_of(regions.regions.begin(), regions.regions.end(),
+      [](const tensor::analyzer::Region &region) {
+        return region.fusion == tensor::analyzer::FusionPattern::AddRMSNorm;
+      });
+  log << "Fusion boundary for externally visible intermediate: "
+      << (passed ? "PASS" : "FAIL") << '\n';
+  return passed;
 }
 
 } // namespace
@@ -171,7 +247,13 @@ bool runTensorGraphExamples(tensor::metal::MetalRuntime &runtime, std::ostream &
   const bool normAligned = runRMSGraph(runtime, 1, 4096, false, log);
   const bool normTail = runRMSGraph(runtime, 3, 4097, false, log);
   const bool addNorm = runRMSGraph(runtime, 3, 4097, true, log);
-  passed = normAligned && normTail && addNorm && passed;
-  log << "\nV2 graph examples: " << (passed ? "PASS" : "FAIL") << '\n';
+  const bool halfNorm = runRMSGraph(runtime, 1, 257, false, log, DType::Float16);
+  const bool addLayerNorm = runLayerNormFusion(runtime, log);
+  const bool linearRelu = runLinearReLUFusion(runtime, log);
+  const bool views = runViewAndReduction(runtime, log);
+  const bool boundary = checkFusionBoundary(log);
+  passed = normAligned && normTail && addNorm && halfNorm && addLayerNorm &&
+           linearRelu && views && boundary && passed;
+  log << "\nTensor graph and fusion examples: " << (passed ? "PASS" : "FAIL") << '\n';
   return passed;
 }

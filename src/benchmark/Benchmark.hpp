@@ -37,5 +37,12 @@ struct PairedResult {
 [[nodiscard]] PairedResult measurePair(const metal::PreparedExecution &baseline,
                                       const metal::PreparedExecution &candidate,
                                       std::size_t samples);
+[[nodiscard]] std::string warmup(const metal::PreparedSequence &execution,
+                                 std::size_t iterations);
+[[nodiscard]] Result measure(const metal::PreparedSequence &execution,
+                             std::size_t samples);
+[[nodiscard]] PairedResult measurePair(const metal::PreparedSequence &baseline,
+                                       const metal::PreparedSequence &candidate,
+                                       std::size_t samples);
 
 } // namespace tensor::benchmark

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "backend/metal/MetalRuntime.hpp"
-#include "planner/KernelPlan.hpp"
+#include "planner/RegionPlan.hpp"
 
 #include <iosfwd>
 
@@ -10,21 +10,25 @@ namespace tensor::runtime {
 struct GraphExecutionResult {
   bool passed = false;
   std::vector<std::vector<float>> outputs;
-  // Sum of per-node GPU command-buffer durations, excluding gaps between nodes.
   std::optional<double> gpuExecutionTimeUs;
   std::string errorMessage;
 };
 
 class CompiledGraph {
 public:
-  CompiledGraph(planner::GraphPlan plan, std::vector<metal::BufferHandle> buffers,
-                std::vector<std::unique_ptr<metal::PreparedExecution>> steps);
+  struct ExecutionUnit {
+    std::string name;
+    std::unique_ptr<metal::PreparedSequence> execution;
+  };
+
+  CompiledGraph(planner::ProgramPlan plan, std::vector<metal::BufferHandle> buffers,
+                std::vector<ExecutionUnit> units);
   [[nodiscard]] GraphExecutionResult run() const;
 
 private:
-  planner::GraphPlan plan_;
+  planner::ProgramPlan plan_;
   std::vector<metal::BufferHandle> buffers_;
-  std::vector<std::unique_ptr<metal::PreparedExecution>> steps_;
+  std::vector<ExecutionUnit> units_;
 };
 
 struct GraphCompilation {
@@ -34,8 +38,6 @@ struct GraphCompilation {
   std::string errorMessage;
 };
 
-// Compiles for these static input tensors. RMSNorm uses V1 autotuning on CPU
-// reference intermediates; graph execution binds the actual GPU intermediates.
 [[nodiscard]] GraphCompilation compileGraph(metal::MetalRuntime &runtime,
                                             const TensorGraph &graph,
                                             const GraphInputs &inputs,

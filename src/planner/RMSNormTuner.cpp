@@ -19,6 +19,11 @@ constexpr double kMinimumSpeedup = 1.05;
 constexpr double kAbsoluteTolerance = 1e-5;
 constexpr double kRelativeTolerance = 1e-4;
 
+metal::ElementType elementType(DType dtype) {
+  return dtype == DType::Float16 ? metal::ElementType::Float16
+                                 : metal::ElementType::Float32;
+}
+
 void reject(CandidateReport &report, const std::string &stage,
              const std::string &reason, std::ostream &log) {
   report.outcome = stage + " FAIL";
@@ -33,9 +38,10 @@ std::string hardwareFilter(const RMSNormOp &op, std::size_t threads,
       threads > hardware.maxThreadgroupMemoryLength / sizeof(float)) {
     return "Thread count or reduction scratch memory exceeds device limits.";
   }
+  const auto bytes = op.input.dtype == DType::Float16 ? sizeof(std::uint16_t) : sizeof(float);
   if (op.input.elementCount() > std::numeric_limits<std::uint32_t>::max() ||
-      op.input.elementCount() > hardware.maxBufferLength / sizeof(float) ||
-      op.weight.elementCount() > hardware.maxBufferLength / sizeof(float)) {
+      op.input.elementCount() > hardware.maxBufferLength / bytes ||
+      op.weight.elementCount() > hardware.maxBufferLength / bytes) {
     return "Tensor size exceeds the kernel index or device buffer limit.";
   }
   return {};
@@ -45,7 +51,8 @@ std::string interfaceCheck(const RMSNormOp &op, const metal::GeneratedKernel &ke
                            const metal::ComputePipelineResult &pipeline,
                            const metal::HardwareInfo &hardware,
                            std::size_t expectedThreads) {
-  const auto bindingError = metal::checkFloatBufferInterface(pipeline, 2);
+  const auto type = elementType(op.input.dtype);
+  const auto bindingError = metal::checkBufferInterface(pipeline, {type, type}, type);
   if (!bindingError.empty()) return bindingError;
   if (kernel.threadgroupCount != op.input.elementCount() / op.input.shape.back() ||
       kernel.threadsPerThreadgroup != expectedThreads ||
@@ -57,14 +64,17 @@ std::string interfaceCheck(const RMSNormOp &op, const metal::GeneratedKernel &ke
 }
 
 validation::ValidationResult validateExecution(const metal::ExecutionResult &execution,
-                                               const std::vector<double> &reference) {
+                                               const std::vector<double> &reference,
+                                               DType dtype) {
   if (!execution.executionPassed) {
     validation::ValidationResult result;
     result.errorMessage = execution.errorMessage;
     return result;
   }
+  const double absolute = dtype == DType::Float16 ? 2e-3 : kAbsoluteTolerance;
+  const double relative = dtype == DType::Float16 ? 2e-3 : kRelativeTolerance;
   return validation::compare(execution.output, reference,
-                             kAbsoluteTolerance, kRelativeTolerance);
+                             absolute, relative);
 }
 
 std::unique_ptr<metal::PreparedExecution>
@@ -106,13 +116,15 @@ buildAndValidate(metal::MetalRuntime &runtime, const RMSNormOp &op,
   log << report.name << " | Interface Check: PASS\n";
 
   auto prepared = runtime.prepare(
-      {{input.data(), input.size()}, {weight.data(), weight.size()}},
-      op.output.elementCount(), {kernel.threadgroupCount, kernel.threadsPerThreadgroup});
+      {{input.data(), input.size(), elementType(op.input.dtype)},
+       {weight.data(), weight.size(), elementType(op.weight.dtype)}},
+      op.output.elementCount(), {kernel.threadgroupCount, kernel.threadsPerThreadgroup}, {},
+      elementType(op.output.dtype));
   if (!prepared.execution) {
     reject(report, "Prepare", prepared.errorMessage, log);
     return {};
   }
-  const auto validation = validateExecution(prepared.execution->run(), reference);
+  const auto validation = validateExecution(prepared.execution->run(), reference, op.output.dtype);
   if (!validation.passed) {
     reject(report, "Numerical Validate", validation.errorMessage, log);
     return {};
@@ -148,6 +160,8 @@ TuningResult tuneRMSNorm(metal::MetalRuntime &runtime, const RMSNormOp &op,
                          const std::vector<float> &weight, std::ostream &log) {
   TuningResult result;
   op.validate();
+  const double loggedAbsolute = op.output.dtype == DType::Float16 ? 2e-3 : kAbsoluteTolerance;
+  const double loggedRelative = op.output.dtype == DType::Float16 ? 2e-3 : kRelativeTolerance;
   const auto reference = validation::rmsNormReference(op, input, weight);
   log << "Enumerate: threads={64, 128, 256}\n"
       << "CPU correctness baseline: double-accumulation reference\n"
@@ -156,8 +170,8 @@ TuningResult tuneRMSNorm(metal::MetalRuntime &runtime, const RMSNormOp &op,
       << ", admission requires >= " << kMinimumSpeedup << "x in two paired rounds\n"
       << "Metric: one-dispatch GPU command-buffer duration; compile, allocation, "
          "CPU encoding and readback excluded\n"
-      << "Numerical tolerance: atol=" << kAbsoluteTolerance
-      << ", rtol=" << kRelativeTolerance << '\n';
+      << "Numerical tolerance: atol=" << loggedAbsolute
+      << ", rtol=" << loggedRelative << '\n';
 
   result.baseline.name = "baseline";
   result.baseline.threads = 256;
@@ -254,14 +268,14 @@ TuningResult tuneRMSNorm(metal::MetalRuntime &runtime, const RMSNormOp &op,
 
   // Execute the actual selection once more with fresh NaN output and readback.
   result.finalExecution = winner ? winner->run() : baseline->run();
-  result.finalValidation = validateExecution(result.finalExecution, reference);
+  result.finalValidation = validateExecution(result.finalExecution, reference, op.output.dtype);
   if (!result.finalValidation.passed && winner) {
     reject(result.candidates[winnerIndex], "Final execution",
             result.finalValidation.errorMessage, log);
     log << "Selected candidate failed; executing the retained baseline.\n";
     winner.reset();
     result.finalExecution = baseline->run();
-    result.finalValidation = validateExecution(result.finalExecution, reference);
+    result.finalValidation = validateExecution(result.finalExecution, reference, op.output.dtype);
   }
   if (!result.finalValidation.passed) {
     result.errorMessage = "Final baseline execution/validation failed: " +

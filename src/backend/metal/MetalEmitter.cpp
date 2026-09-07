@@ -18,6 +18,7 @@ GeneratedKernel emitRMSNorm(const RMSNormOp &op, std::size_t threadsPerThreadgro
     throw std::invalid_argument("V1 RMSNorm supports 64, 128, or 256 threads.");
   }
   const std::size_t kThreads = threadsPerThreadgroup;
+  const char *elementType = op.input.dtype == DType::Float16 ? "half" : "float";
   if (elementCount > std::numeric_limits<std::uint32_t>::max()) {
     throw std::invalid_argument("Metal RMSNorm requires 32-bit tensor indices.");
   }
@@ -35,19 +36,17 @@ GeneratedKernel emitRMSNorm(const RMSNormOp &op, std::size_t threadsPerThreadgro
          << "constant float kEpsilon = " << std::scientific
          << std::setprecision(std::numeric_limits<float>::max_digits10)
          << op.epsilon << "f;\n";
-  source << R"metal(
-
-kernel void rms_norm(device const float *input [[buffer(0)]],
-                     device const float *weight [[buffer(1)]],
-                     device float *output [[buffer(2)]],
-                     uint tid [[thread_index_in_threadgroup]],
+  source << "\nkernel void rms_norm(device const " << elementType << " *input [[buffer(0)]],\n"
+         << "                     device const " << elementType << " *weight [[buffer(1)]],\n"
+         << "                     device " << elementType << " *output [[buffer(2)]],\n"
+         << R"metal(                     uint tid [[thread_index_in_threadgroup]],
                      uint3 group [[threadgroup_position_in_grid]]) {
   const uint rowOffset = group.x * kWidth;
   threadgroup float partial[kThreads];
 
   float sumSquares = 0.0f;
   for (ulong column = tid; column < kWidth; column += kThreads) {
-    const float x = input[rowOffset + column];
+    const float x = float(input[rowOffset + column]);
     sumSquares += x * x;
   }
   partial[tid] = sumSquares;
@@ -64,7 +63,7 @@ kernel void rms_norm(device const float *input [[buffer(0)]],
   const float inverseRms = rsqrt(partial[0] / float(kWidth) + kEpsilon);
   for (ulong column = tid; column < kWidth; column += kThreads) {
     output[rowOffset + column] =
-        input[rowOffset + column] * inverseRms * weight[column];
+        float(input[rowOffset + column]) * inverseRms * float(weight[column]);
   }
 }
 )metal";

@@ -6,6 +6,7 @@
 #include <string>
 
 namespace tensor::planner { struct KernelPlan; }
+namespace tensor::analyzer { struct Region; struct AnalyzedGraph; }
 
 namespace tensor::metal {
 
@@ -25,5 +26,8 @@ struct GeneratedKernel {
 [[nodiscard]] GeneratedKernel emitRMSNormBaseline(const RMSNormOp &op);
 
 [[nodiscard]] GeneratedKernel emitKernel(const planner::KernelPlan &plan);
+[[nodiscard]] GeneratedKernel emitFusion(const analyzer::Region &region,
+                                         const analyzer::AnalyzedGraph &graph,
+                                         std::size_t threadsPerThreadgroup);
 
 } // namespace tensor::metal

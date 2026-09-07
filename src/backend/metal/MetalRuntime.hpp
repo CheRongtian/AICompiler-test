@@ -9,6 +9,8 @@
 
 namespace tensor::metal {
 
+enum class ElementType { Float16, Float32, Int32 };
+
 struct HardwareInfo {
   std::size_t maxThreadsPerThreadgroup = 0;
   std::size_t maxThreadgroupMemoryLength = 0;
@@ -19,6 +21,8 @@ struct PipelineBinding {
   std::size_t index = 0;
   bool isBuffer = false;
   bool isFloat32 = false;
+  bool isFloat16 = false;
+  bool isInt32 = false;
   bool readOnly = false;
   bool writable = false;
 };
@@ -38,6 +42,9 @@ struct ComputePipelineResult {
 
 [[nodiscard]] std::string checkFloatBufferInterface(const ComputePipelineResult &pipeline,
                                                     std::size_t inputCount);
+[[nodiscard]] std::string
+checkBufferInterface(const ComputePipelineResult &pipeline,
+                     const std::vector<ElementType> &inputs, ElementType output);
 
 // Shared GPU storage, opaque to C++. read() requires completed GPU execution.
 class MetalBuffer {
@@ -46,6 +53,7 @@ public:
   MetalBuffer(const MetalBuffer &) = delete;
   MetalBuffer &operator=(const MetalBuffer &) = delete;
   [[nodiscard]] std::size_t elementCount() const;
+  [[nodiscard]] ElementType elementType() const;
   [[nodiscard]] std::vector<float> read() const;
 
 private:
@@ -65,6 +73,7 @@ struct BufferResult {
 struct FloatBufferView {
   const float *data = nullptr;
   std::size_t elementCount = 0;
+  ElementType elementType = ElementType::Float32;
 };
 
 struct DispatchSize {
@@ -107,6 +116,26 @@ struct PreparationResult {
   std::string errorMessage;
 };
 
+// A dependency-ordered sequence encoded into one Metal command buffer.
+class PreparedSequence {
+public:
+  ~PreparedSequence();
+  PreparedSequence(const PreparedSequence &) = delete;
+  PreparedSequence &operator=(const PreparedSequence &) = delete;
+  [[nodiscard]] ExecutionResult execute() const;
+
+private:
+  friend class MetalRuntime;
+  class Impl;
+  explicit PreparedSequence(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+};
+
+struct SequencePreparationResult {
+  std::unique_ptr<PreparedSequence> execution;
+  std::string errorMessage;
+};
+
 class MetalRuntime {
 public:
   MetalRuntime();
@@ -127,26 +156,31 @@ public:
   createComputePipeline(const std::string &source,
                         const std::string &functionName);
 
-  // Inputs bind at indices [0, inputs.size()), then one fp32 output buffer.
+  // Inputs bind at indices [0, inputs.size()), followed by one typed output buffer.
   // Optional uint32 constants bind at inputs.size() + 1 using setBytes.
   // The caller supplies bindings and dispatch matching the compiled kernel.
   // A new compilation attempt clears the previous pipeline, including on failure.
   [[nodiscard]] ExecutionResult
   run(const std::vector<FloatBufferView> &inputs,
       std::size_t outputElementCount, const DispatchSize &dispatch,
-      const std::vector<std::uint32_t> &constants = {}) const;
+      const std::vector<std::uint32_t> &constants = {},
+      ElementType outputType = ElementType::Float32) const;
 
   [[nodiscard]] PreparationResult
   prepare(const std::vector<FloatBufferView> &inputs,
           std::size_t outputElementCount, const DispatchSize &dispatch,
-          const std::vector<std::uint32_t> &constants = {}) const;
+          const std::vector<std::uint32_t> &constants = {},
+          ElementType outputType = ElementType::Float32) const;
 
   [[nodiscard]] BufferResult createBuffer(std::size_t elementCount,
-                                          const float *initialData = nullptr) const;
+                                          const float *initialData = nullptr,
+                                          ElementType type = ElementType::Float32) const;
   [[nodiscard]] PreparationResult
   prepareBuffers(const std::vector<BufferHandle> &inputs, const BufferHandle &output,
                  const DispatchSize &dispatch,
                  const std::vector<std::uint32_t> &constants = {}) const;
+  [[nodiscard]] SequencePreparationResult
+  prepareSequence(const std::vector<const PreparedExecution *> &steps) const;
 
 private:
   class Impl;
