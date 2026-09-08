@@ -5,6 +5,7 @@
 #include "kv_cache_main.hpp"
 #include "paged_kv_main.hpp"
 #include "pytorch_import_main.hpp"
+#include "serving_main.hpp"
 #include "tensor_graph_examples.hpp"
 #include "transformer_decode_main.hpp"
 #include "validation/Validator.hpp"
@@ -175,6 +176,10 @@ int main(int argc, char **argv) {
                  ? 0
                  : 1;
     }
+    if (argc == 5 && std::string(argv[1]) == "--serving" &&
+        std::string(argv[3]) == "--kernel-library") {
+      return runServingWorkload(runtime, argv[2], std::cout, argv[4]) ? 0 : 1;
+    }
     if (argc == 9 && std::string(argv[1]) == "--benchmark-decoder-llm" &&
         std::string(argv[3]) == "--kernel-library" &&
         std::string(argv[5]) == "--warmup" &&
@@ -222,6 +227,7 @@ int main(int argc, char **argv) {
                    " [--decoder-llm <decoder-manifest> [--kernel-library <directory>]]"
                    " [--paged-kv <decoder-manifest> --page-size <tokens>"
                    " --chunk-size <tokens> --kernel-library <directory>]"
+                   " [--serving <decoder-manifest> --kernel-library <directory>]"
                    " [--benchmark-decoder-llm <decoder-manifest>"
                    " --kernel-library <directory> --warmup <runs> --samples <runs>]"
                    " [--emit-kernel-contract <json> [--pattern <pattern>]]"

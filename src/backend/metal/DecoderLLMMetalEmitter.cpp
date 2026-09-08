@@ -222,6 +222,118 @@ GeneratedKernel emitDecoderPagedCacheAppend(
   return kernel;
 }
 
+GeneratedKernel emitServingRoPE(
+    const planner::DecoderLLMPlan &plan, std::size_t maximumBatchSize,
+    const std::string &functionName) {
+  plan.validate();
+  if (maximumBatchSize == 0) {
+    throw std::invalid_argument("Serving RoPE batch size is invalid.");
+  }
+  const auto pairs = plan.attention.headDimension / 2;
+  const auto perRequest = plan.attention.heads * pairs;
+  const auto workItems = maximumBatchSize * perRequest;
+  auto kernel = beginKernel(workItems, plan.attention.threadsPerThreadgroup,
+                            functionName);
+  const auto hidden = plan.hiddenSize();
+  std::ostringstream source;
+  source << "#include <metal_stdlib>\nusing namespace metal;\n\n"
+         << "kernel void " << functionName << "(\n"
+         << "  device const float *input [[buffer(0)]],\n"
+         << "  device const float *cosine [[buffer(1)]],\n"
+         << "  device const float *sine [[buffer(2)]],\n"
+         << "  device const int *validLengths [[buffer(3)]],\n"
+         << "  device const int *activeCount [[buffer(4)]],\n"
+         << "  device float *output [[buffer(5)]],\n"
+         << "  uint gid [[thread_position_in_grid]]) {\n"
+         << "  const uint request = gid / " << perRequest << "u;\n"
+         << "  if (gid >= " << workItems
+         << "u || request >= uint(activeCount[0])) return;\n"
+         << "  const uint pair = gid % " << pairs << "u;\n"
+         << "  const uint head = (gid / " << pairs << "u) % "
+         << plan.attention.heads << "u;\n"
+         << "  const int validValue = validLengths[request];\n"
+         << "  if (validValue <= 0 || uint(validValue) > "
+         << plan.attention.capacity << "u) return;\n"
+         << "  const uint position = uint(validValue - 1);\n"
+         << "  const uint inputBase = request * " << hidden
+         << "u + head * " << plan.attention.headDimension
+         << "u + pair * 2u;\n"
+         << "  const uint outputBase = (request * "
+         << plan.attention.heads << "u + head) * "
+         << plan.attention.headDimension << "u + pair * 2u;\n"
+         << "  const float c = cosine[position * " << pairs
+         << "u + pair];\n"
+         << "  const float s = sine[position * " << pairs
+         << "u + pair];\n"
+         << "  const float even = input[inputBase];\n"
+         << "  const float odd = input[inputBase + 1u];\n"
+         << "  output[outputBase] = even * c - odd * s;\n"
+         << "  output[outputBase + 1u] = even * s + odd * c;\n"
+         << "}\n";
+  kernel.source = source.str();
+  return kernel;
+}
+
+GeneratedKernel emitServingPagedCacheAppend(
+    const planner::DecoderLLMPlan &plan, std::size_t maximumBatchSize,
+    bool inputIsHeadMajor, std::size_t pageSize,
+    const std::string &functionName) {
+  plan.validate();
+  if (maximumBatchSize == 0 || pageSize == 0 ||
+      pageSize > plan.attention.capacity) {
+    throw std::invalid_argument("Serving paged-cache configuration is invalid.");
+  }
+  const auto hidden = plan.hiddenSize();
+  const auto maximumPages =
+      (plan.attention.capacity + pageSize - 1) / pageSize;
+  const auto workItems = maximumBatchSize * hidden;
+  auto kernel = beginKernel(workItems, plan.attention.threadsPerThreadgroup,
+                            functionName);
+  std::ostringstream source;
+  source << "#include <metal_stdlib>\nusing namespace metal;\n\n"
+         << "kernel void " << functionName << "(\n"
+         << "  device const float *input [[buffer(0)]],\n"
+         << "  device const int *validLengths [[buffer(1)]],\n"
+         << "  device const int *blockTables [[buffer(2)]],\n"
+         << "  device const int *activeCount [[buffer(3)]],\n"
+         << "  device float *cache [[buffer(4)]],\n"
+         << "  uint gid [[thread_position_in_grid]]) {\n"
+         << "  const uint request = gid / " << hidden << "u;\n"
+         << "  if (gid >= " << workItems
+         << "u || request >= uint(activeCount[0])) return;\n"
+         << "  const uint feature = gid % " << hidden << "u;\n"
+         << "  const uint head = feature / "
+         << plan.attention.headDimension << "u;\n"
+         << "  const uint component = feature % "
+         << plan.attention.headDimension << "u;\n"
+         << "  const int validValue = validLengths[request];\n"
+         << "  if (validValue <= 0 || uint(validValue) > "
+         << plan.attention.capacity << "u) return;\n"
+         << "  const uint position = uint(validValue - 1);\n"
+         << "  const uint logicalPage = position / " << pageSize << "u;\n"
+         << "  const uint pageOffset = position % " << pageSize << "u;\n"
+         << "  const int physicalPageValue = blockTables[request * "
+         << maximumPages << "u + logicalPage];\n"
+         << "  if (physicalPageValue < 0) return;\n"
+         << "  const uint physicalPage = uint(physicalPageValue);\n"
+         << "  const uint cacheIndex = ((physicalPage * "
+         << plan.attention.heads << "u + head) * " << pageSize
+         << "u + pageOffset) * " << plan.attention.headDimension
+         << "u + component;\n";
+  if (inputIsHeadMajor) {
+    source << "  const uint inputIndex = (request * "
+           << plan.attention.heads << "u + head) * "
+           << plan.attention.headDimension << "u + component;\n";
+  } else {
+    source << "  const uint inputIndex = request * " << hidden
+           << "u + feature;\n";
+  }
+  source << "  cache[cacheIndex] = input[inputIndex];\n"
+         << "}\n";
+  kernel.source = source.str();
+  return kernel;
+}
+
 GeneratedKernel emitDecoderAdd(std::size_t elementCount, std::size_t threads,
                                const std::string &functionName) {
   auto kernel = beginKernel(elementCount, threads, functionName);

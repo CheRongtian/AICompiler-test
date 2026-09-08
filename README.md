@@ -16,6 +16,8 @@ AICompiler/
 │   ├── kv_cache_main.hpp
 │   ├── paged_kv_main.cpp
 │   ├── paged_kv_main.hpp
+│   ├── serving_main.cpp
+│   ├── serving_main.hpp
 │   ├── pytorch_import_main.cpp
 │   ├── pytorch_import_main.hpp
 │   ├── tensor_graph_examples.cpp
@@ -64,6 +66,7 @@ AICompiler/
 │   │   ├── KVCacheState.*
 │   │   ├── KernelRegistry.*
 │   │   ├── StatefulExecutor.*
+│   │   ├── ServingRuntime.*
 │   │   └── TransformerDecodeExecutor.*
 │   ├── tensor/
 │   │   ├── TensorIR.*
@@ -290,5 +293,21 @@ Generation uses the same remote Workflow for all six patterns. Decoder execution
 ```
 
 This stage intentionally covers one request. Continuous batching, preemption, and multi-request page scheduling remain in the following serving stage.
+
+### Continuous batching and preemption
+
+- Uses one shared physical K/V page pool per decoder layer while every request keeps an independent block table and valid length.
+- Schedules three requests with different prompt lengths, decode lengths, and arrival steps through chunked prefill and batched decode.
+- Packs active token IDs, cache lengths, and per-layer block tables into a request-aware Metal ABI and submits one shared decoder sequence per scheduler tick.
+- Spills a request's logical KV cache to host memory under page pressure, releases its pages, and restores the request into newly allocated pages before continuing.
+- Audits physical-page isolation, requires an exercised preemption/resume path, and verifies that all page allocations are released.
+- Compares every request's prefill logits, decode logits, and generated token chain with independent sequential Paged KV + Chunked Prefill execution.
+- Reports separate prefill, batched decode, scheduler, KV-management, and spill/restore timings together with decoded-token and Metal-submission counts.
+
+```bash
+./run.sh serving
+```
+
+The shared decoder owns one reusable batched Metal sequence; active requests only contribute dynamic token/cache metadata. An HTTP server and distributed execution are outside this stage.
 
 AgentCompile evaluates CUDA/A800 mechanisms. This project evaluates the corresponding compiler and runtime principles on Apple M3 Pro, Metal, and unified memory; the reported measurements describe these Metal implementations.

@@ -75,6 +75,8 @@ add_executable(TensorMetalCompiler
   apps/kv_cache_main.cpp
   apps/paged_kv_main.hpp
   apps/paged_kv_main.cpp
+  apps/serving_main.hpp
+  apps/serving_main.cpp
   apps/pytorch_import_main.hpp
   apps/pytorch_import_main.cpp
   apps/tensor_graph_examples.hpp
@@ -139,6 +141,8 @@ add_executable(TensorMetalCompiler
   src/runtime/TransformerDecodeExecutor.cpp
   src/runtime/DecoderLLMExecutor.hpp
   src/runtime/DecoderLLMExecutor.cpp
+  src/runtime/ServingRuntime.hpp
+  src/runtime/ServingRuntime.cpp
   src/importer/PyTorchImporter.hpp
   src/importer/PyTorchImporter.cpp
   src/importer/KVCacheImporter.hpp

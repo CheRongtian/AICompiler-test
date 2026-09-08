@@ -265,6 +265,91 @@ GeneratedKernel emitPagedKVAttention(const planner::KVCachePlan &plan,
   return kernel;
 }
 
+GeneratedKernel emitServingPagedKVAttention(
+    const planner::KVCachePlan &plan, std::size_t maximumBatchSize,
+    std::size_t pageSize, const std::string &functionName) {
+  plan.validate();
+  if (maximumBatchSize == 0 || pageSize == 0 || pageSize > plan.capacity ||
+      functionName.empty()) {
+    throw std::invalid_argument("Serving paged-attention configuration is invalid.");
+  }
+  const auto dimension = plan.modelDimension();
+  const auto maximumPages = (plan.capacity + pageSize - 1) / pageSize;
+  const auto workItems = maximumBatchSize * dimension;
+  const auto scale = static_cast<float>(
+      1.0 / std::sqrt(static_cast<double>(plan.headDimension)));
+  auto kernel = beginKernel(plan, workItems, functionName.c_str());
+  std::ostringstream source;
+  source.imbue(std::locale::classic());
+  source << "#include <metal_stdlib>\nusing namespace metal;\n\n"
+         << "kernel void " << functionName << "(\n"
+         << "  device const float *query [[buffer(0)]],\n"
+         << "  device const float *keyCache [[buffer(1)]],\n"
+         << "  device const float *valueCache [[buffer(2)]],\n"
+         << "  device const int *validLengths [[buffer(3)]],\n"
+         << "  device const int *blockTables [[buffer(4)]],\n"
+         << "  device const int *activeCount [[buffer(5)]],\n"
+         << "  device float *context [[buffer(6)]],\n"
+         << "  uint gid [[thread_position_in_grid]]) {\n"
+         << "  const uint request = gid / " << dimension << "u;\n"
+         << "  if (gid >= " << workItems
+         << "u || request >= uint(activeCount[0])) return;\n"
+         << "  const uint feature = gid % " << dimension << "u;\n"
+         << "  const uint head = feature / " << plan.headDimension << "u;\n"
+         << "  const uint component = feature % " << plan.headDimension
+         << "u;\n"
+         << "  const int validValue = validLengths[request];\n"
+         << "  if (validValue <= 0 || uint(validValue) > " << plan.capacity
+         << "u) return;\n"
+         << "  const uint valid = uint(validValue);\n"
+         << "  const uint queryBase = (request * " << plan.heads
+         << "u + head) * " << plan.headDimension << "u;\n"
+         << "  float maximum = -INFINITY;\n"
+         << "  for (uint position = 0; position < valid; ++position) {\n"
+         << "    const uint logicalPage = position / " << pageSize << "u;\n"
+         << "    const uint pageOffset = position % " << pageSize << "u;\n"
+         << "    const int physicalPageValue = blockTables[request * "
+         << maximumPages << "u + logicalPage];\n"
+         << "    if (physicalPageValue < 0) return;\n"
+         << "    const uint physicalPage = uint(physicalPageValue);\n"
+         << "    const uint cacheBase = ((physicalPage * " << plan.heads
+         << "u + head) * " << pageSize << "u + pageOffset) * "
+         << plan.headDimension << "u;\n"
+         << "    float score = 0.0f;\n"
+         << "    for (uint inner = 0; inner < " << plan.headDimension
+         << "u; ++inner) score += query[queryBase + inner] * keyCache[cacheBase + inner];\n"
+         << "    maximum = max(maximum, score * " << std::scientific
+         << std::setprecision(std::numeric_limits<float>::max_digits10) << scale
+         << "f);\n"
+         << "  }\n"
+         << "  float denominator = 0.0f;\n"
+         << "  float weighted = 0.0f;\n"
+         << "  for (uint position = 0; position < valid; ++position) {\n"
+         << "    const uint logicalPage = position / " << pageSize << "u;\n"
+         << "    const uint pageOffset = position % " << pageSize << "u;\n"
+         << "    const int physicalPageValue = blockTables[request * "
+         << maximumPages << "u + logicalPage];\n"
+         << "    if (physicalPageValue < 0) return;\n"
+         << "    const uint physicalPage = uint(physicalPageValue);\n"
+         << "    const uint cacheBase = ((physicalPage * " << plan.heads
+         << "u + head) * " << pageSize << "u + pageOffset) * "
+         << plan.headDimension << "u;\n"
+         << "    float score = 0.0f;\n"
+         << "    for (uint inner = 0; inner < " << plan.headDimension
+         << "u; ++inner) score += query[queryBase + inner] * keyCache[cacheBase + inner];\n"
+         << "    const float probability = exp(score * " << std::scientific
+         << std::setprecision(std::numeric_limits<float>::max_digits10) << scale
+         << "f - maximum);\n"
+         << "    denominator += probability;\n"
+         << "    weighted += probability * valueCache[cacheBase + component];\n"
+         << "  }\n"
+         << "  context[request * " << dimension
+         << "u + feature] = weighted / denominator;\n"
+         << "}\n";
+  kernel.source = source.str();
+  return kernel;
+}
+
 GeneratedKernel emitKVOutputProjection(const planner::KVCachePlan &plan,
                                        std::size_t queryLength) {
   requireQueryLength(plan, queryLength);

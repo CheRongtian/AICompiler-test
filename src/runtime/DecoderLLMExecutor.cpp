@@ -634,6 +634,71 @@ CompiledDecoderLLM::kvBlockTable(std::size_t layer) const {
   return impl_->states[layer]->pageTable();
 }
 
+DecoderKVSnapshot CompiledDecoderLLM::snapshotKVCache() const {
+  DecoderKVSnapshot snapshot;
+  snapshot.length = currentLength();
+  snapshot.keyCaches.reserve(impl_->states.size());
+  snapshot.valueCaches.reserve(impl_->states.size());
+  for (const auto &state : impl_->states) {
+    snapshot.keyCaches.push_back(state->readKeyPrefix());
+    snapshot.valueCaches.push_back(state->readValuePrefix());
+  }
+  return snapshot;
+}
+
+std::string CompiledDecoderLLM::releaseKVCache() { return reset(); }
+
+std::string
+CompiledDecoderLLM::restoreKVCache(const DecoderKVSnapshot &snapshot) {
+  if (currentLength() != 0) {
+    return "Decoder KV restore requires an empty cache.";
+  }
+  if (snapshot.length == 0 ||
+      snapshot.keyCaches.size() != impl_->states.size() ||
+      snapshot.valueCaches.size() != impl_->states.size()) {
+    return "Decoder KV snapshot does not match the compiled model.";
+  }
+  for (std::size_t layer = 0; layer < impl_->states.size(); ++layer) {
+    const auto error = impl_->states[layer]->restore(
+        *impl_->runtime, snapshot.length, snapshot.keyCaches[layer],
+        snapshot.valueCaches[layer]);
+    if (!error.empty()) {
+      for (auto &state : impl_->states) {
+        (void)state->reset(*impl_->runtime);
+      }
+      return error;
+    }
+  }
+  return {};
+}
+
+std::string CompiledDecoderLLM::stageKVLength(std::size_t length) {
+  const auto previous = currentLength();
+  for (auto &state : impl_->states) {
+    const auto error = state->stageLength(*impl_->runtime, length);
+    if (!error.empty()) {
+      for (auto &staged : impl_->states) {
+        (void)staged->rollbackLength(*impl_->runtime, previous);
+      }
+      return error;
+    }
+  }
+  return {};
+}
+
+void CompiledDecoderLLM::commitKVLength(std::size_t length) {
+  for (auto &state : impl_->states) state->commitLength(length);
+}
+
+std::string CompiledDecoderLLM::rollbackKVLength(std::size_t length) {
+  std::string firstError;
+  for (auto &state : impl_->states) {
+    const auto error = state->rollbackLength(*impl_->runtime, length);
+    if (firstError.empty()) firstError = error;
+  }
+  return firstError;
+}
+
 void CompiledDecoderLLM::resetKernelUsage() noexcept {
   impl_->registry.resetUsage();
 }
@@ -667,6 +732,19 @@ DecoderLLMCompilation compileDecoderLLM(
       if (options.prefillChunkSize >= workload.plan.attention.prefillLength) {
         throw std::invalid_argument(
             "Prefill chunk size must be smaller than the full prefill length.");
+      }
+    }
+    if (!options.sharedKVPools.empty()) {
+      if (options.kvPageSize == 0 ||
+          options.sharedKVPools.size() != workload.plan.layerCount) {
+        throw std::invalid_argument(
+            "Shared KV pools require a page size and one pool per layer.");
+      }
+      for (const auto &pool : options.sharedKVPools) {
+        if (!pool || pool->pageSize() != options.kvPageSize) {
+          throw std::invalid_argument(
+              "Shared KV pool page size differs from decoder options.");
+        }
       }
     }
 
@@ -712,10 +790,13 @@ DecoderLLMCompilation compileDecoderLLM(
                                 workload.ropeCosine.data());
     impl->ropeSine = allocate(runtime, workload.ropeSine.size(),
                               workload.ropeSine.data());
-    for (const auto &parameters : workload.layers) {
-      impl->layers.push_back(allocateLayer(runtime, parameters));
-      auto state = createKVCacheState(runtime, plan.attention,
-                                      options.kvPageSize);
+    for (std::size_t layer = 0; layer < workload.layers.size(); ++layer) {
+      impl->layers.push_back(allocateLayer(runtime, workload.layers[layer]));
+      auto state = options.sharedKVPools.empty()
+                       ? createKVCacheState(runtime, plan.attention,
+                                            options.kvPageSize)
+                       : createKVCacheState(runtime, plan.attention,
+                                            options.sharedKVPools[layer]);
       if (!state.state) throw std::runtime_error(state.errorMessage);
       impl->states.push_back(std::move(state.state));
     }

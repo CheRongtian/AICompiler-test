@@ -29,6 +29,15 @@ namespace tensor::metal {
     bool inputIsHeadMajor, std::size_t pageSize,
     const std::string &functionName);
 
+[[nodiscard]] GeneratedKernel emitServingRoPE(
+    const planner::DecoderLLMPlan &plan, std::size_t maximumBatchSize,
+    const std::string &functionName);
+
+[[nodiscard]] GeneratedKernel emitServingPagedCacheAppend(
+    const planner::DecoderLLMPlan &plan, std::size_t maximumBatchSize,
+    bool inputIsHeadMajor, std::size_t pageSize,
+    const std::string &functionName);
+
 [[nodiscard]] GeneratedKernel emitDecoderAdd(
     std::size_t elementCount, std::size_t threads,
     const std::string &functionName);
