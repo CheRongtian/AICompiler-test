@@ -3,6 +3,7 @@
 #include "decoder_llm_main.hpp"
 #include "generated_kernel_main.hpp"
 #include "kv_cache_main.hpp"
+#include "paged_kv_main.hpp"
 #include "pytorch_import_main.hpp"
 #include "tensor_graph_examples.hpp"
 #include "transformer_decode_main.hpp"
@@ -163,6 +164,17 @@ int main(int argc, char **argv) {
         std::string(argv[3]) == "--kernel-library") {
       return runDecoderLLMWorkload(runtime, argv[2], std::cout, argv[4]) ? 0 : 1;
     }
+    if (argc == 9 && std::string(argv[1]) == "--paged-kv" &&
+        std::string(argv[3]) == "--page-size" &&
+        std::string(argv[5]) == "--chunk-size" &&
+        std::string(argv[7]) == "--kernel-library") {
+      return runPagedKVWorkload(
+                 runtime, argv[2], parseCount(argv[4], "KV page size"),
+                 parseCount(argv[6], "prefill chunk size"), std::cout,
+                 argv[8])
+                 ? 0
+                 : 1;
+    }
     if (argc == 9 && std::string(argv[1]) == "--benchmark-decoder-llm" &&
         std::string(argv[3]) == "--kernel-library" &&
         std::string(argv[5]) == "--warmup" &&
@@ -208,6 +220,8 @@ int main(int argc, char **argv) {
                    " [--kv-cache <cache-manifest>]"
                    " [--transformer-decode <decoder-manifest>]"
                    " [--decoder-llm <decoder-manifest> [--kernel-library <directory>]]"
+                   " [--paged-kv <decoder-manifest> --page-size <tokens>"
+                   " --chunk-size <tokens> --kernel-library <directory>]"
                    " [--benchmark-decoder-llm <decoder-manifest>"
                    " --kernel-library <directory> --warmup <runs> --samples <runs>]"
                    " [--emit-kernel-contract <json> [--pattern <pattern>]]"

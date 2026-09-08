@@ -243,8 +243,9 @@ bool runDecoderLLMBenchmark(tensor::metal::MetalRuntime &runtime,
       << '\n';
 
   log << "Compiling template-only decoder:\n";
+  tensor::runtime::DecoderLLMCompileOptions templateOptions;
   auto templateCompilation = tensor::runtime::compileDecoderLLM(
-      runtime, workload, log, {});
+      runtime, workload, log, templateOptions);
   if (!templateCompilation.executable) {
     log << "Template-only compilation: FAIL\n"
         << "Compiler error: " << templateCompilation.errorMessage << '\n';
@@ -252,8 +253,10 @@ bool runDecoderLLMBenchmark(tensor::metal::MetalRuntime &runtime,
   }
 
   log << "Compiling generated-enabled decoder:\n";
+  tensor::runtime::DecoderLLMCompileOptions generatedOptions;
+  generatedOptions.kernelLibrary = options.kernelLibrary;
   auto generatedCompilation = tensor::runtime::compileDecoderLLM(
-      runtime, workload, log, options.kernelLibrary);
+      runtime, workload, log, generatedOptions);
   if (!generatedCompilation.executable) {
     log << "Generated-enabled compilation: FAIL\n"
         << "Compiler error: " << generatedCompilation.errorMessage << '\n';

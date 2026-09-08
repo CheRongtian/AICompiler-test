@@ -73,6 +73,8 @@ add_executable(TensorMetalCompiler
   apps/generated_kernel_main.cpp
   apps/kv_cache_main.hpp
   apps/kv_cache_main.cpp
+  apps/paged_kv_main.hpp
+  apps/paged_kv_main.cpp
   apps/pytorch_import_main.hpp
   apps/pytorch_import_main.cpp
   apps/tensor_graph_examples.hpp

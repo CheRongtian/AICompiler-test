@@ -168,6 +168,60 @@ GeneratedKernel emitDecoderCacheAppend(
   return kernel;
 }
 
+GeneratedKernel emitDecoderPagedCacheAppend(
+    const planner::DecoderLLMPlan &plan, std::size_t sequenceLength,
+    bool inputIsHeadMajor, std::size_t pageSize,
+    const std::string &functionName) {
+  plan.validate();
+  if (pageSize == 0 || pageSize > plan.attention.capacity) {
+    throw std::invalid_argument("Decoder paged-cache page size is invalid.");
+  }
+  const auto workItems = plan.hiddenElementCount(sequenceLength);
+  const auto hidden = plan.hiddenSize();
+  auto kernel = beginKernel(workItems, plan.attention.threadsPerThreadgroup,
+                            functionName);
+  std::ostringstream source;
+  source << "#include <metal_stdlib>\nusing namespace metal;\n\n"
+         << "kernel void " << functionName << "(\n"
+         << "  device const float *input [[buffer(0)]],\n"
+         << "  device const int *validLength [[buffer(1)]],\n"
+         << "  device const int *blockTable [[buffer(2)]],\n"
+         << "  device float *cache [[buffer(3)]],\n"
+         << "  uint gid [[thread_position_in_grid]]) {\n"
+         << "  if (gid >= " << workItems << "u) return;\n"
+         << "  const uint feature = gid % " << hidden << "u;\n"
+         << "  const uint token = (gid / " << hidden << "u) % "
+         << sequenceLength << "u;\n"
+         << "  const uint batch = gid / " << hidden * sequenceLength << "u;\n"
+         << "  const uint head = feature / " << plan.attention.headDimension << "u;\n"
+         << "  const uint component = feature % " << plan.attention.headDimension << "u;\n"
+         << "  const uint valid = uint(validLength[0]);\n"
+         << "  if (valid < " << sequenceLength << "u || valid > "
+         << plan.attention.capacity << "u) return;\n"
+         << "  const uint position = valid - " << sequenceLength << "u + token;\n"
+         << "  const uint logicalPage = position / " << pageSize << "u;\n"
+         << "  const uint pageOffset = position % " << pageSize << "u;\n"
+         << "  const int physicalPageValue = blockTable[logicalPage];\n"
+         << "  if (physicalPageValue < 0) return;\n"
+         << "  const uint physicalPage = uint(physicalPageValue);\n"
+         << "  const uint cacheIndex = (((physicalPage * "
+         << plan.attention.batch << "u + batch) * " << plan.attention.heads
+         << "u + head) * " << pageSize << "u + pageOffset) * "
+         << plan.attention.headDimension << "u + component;\n";
+  if (inputIsHeadMajor) {
+    source << "  const uint inputIndex = ((batch * " << plan.attention.heads
+           << "u + head) * " << sequenceLength << "u + token) * "
+           << plan.attention.headDimension << "u + component;\n";
+  } else {
+    source << "  const uint inputIndex = (batch * " << sequenceLength
+           << "u + token) * " << hidden << "u + feature;\n";
+  }
+  source << "  cache[cacheIndex] = input[inputIndex];\n"
+         << "}\n";
+  kernel.source = source.str();
+  return kernel;
+}
+
 GeneratedKernel emitDecoderAdd(std::size_t elementCount, std::size_t threads,
                                const std::string &functionName) {
   auto kernel = beginKernel(elementCount, threads, functionName);

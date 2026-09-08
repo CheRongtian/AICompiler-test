@@ -78,7 +78,10 @@ bool runDecoderLLMWorkload(tensor::metal::MetalRuntime &runtime,
       << ", decode_steps=" << workload.decodeSteps.size()
       << ", capacity=" << plan.attention.capacity << '\n';
 
-  auto compilation = tensor::runtime::compileDecoderLLM(runtime, workload, log, kernelLibrary);
+  tensor::runtime::DecoderLLMCompileOptions options;
+  options.kernelLibrary = kernelLibrary;
+  auto compilation =
+      tensor::runtime::compileDecoderLLM(runtime, workload, log, options);
   if (!compilation.executable) {
     log << "Decoder-only compilation: FAIL\n"
         << "Compiler error: " << compilation.errorMessage << '\n';

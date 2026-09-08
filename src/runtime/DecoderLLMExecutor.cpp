@@ -146,7 +146,8 @@ Buffer intermediate(metal::MetalRuntime &runtime, DecoderStage &stage,
 
 DecoderStage buildStage(
     metal::MetalRuntime &runtime, const DecoderLLMWorkload &workload,
-    std::size_t sequenceLength, const Buffer &embeddingWeight,
+    std::size_t sequenceLength, const std::string &stageName,
+    const Buffer &embeddingWeight,
     const Buffer &finalNormWeight, const Buffer &languageModelHeadWeight,
     const Buffer &ropeCosine, const Buffer &ropeSine,
     const std::vector<LayerBuffers> &layers,
@@ -163,7 +164,6 @@ DecoderStage buildStage(
       plan.intermediateElementCount(sequenceLength);
   const auto threads = plan.attention.threadsPerThreadgroup;
   const bool decodeStage = sequenceLength == 1;
-  const std::string stageName = decodeStage ? "decode" : "prefill";
 
   stage.tokenIds =
       allocate(runtime, rows, nullptr, metal::ElementType::Int32);
@@ -290,27 +290,61 @@ DecoderStage buildStage(
         rotatedKey, metal::ElementType::Float32, log));
       track(prefix+"qk_rope","decoder_rope","template",prefix+"q_rope,"+prefix+"k_rope",2);
     }
-    steps.push_back(prepare(
-        runtime,
-        metal::emitDecoderCacheAppend(plan, sequenceLength, true,
-                                      prefix + "key_cache_append"),
-        {rotatedKey, states[index]->lengthBuffer()},
-        {metal::ElementType::Float32, metal::ElementType::Int32},
-        states[index]->keyBuffer(), metal::ElementType::Float32, log));
-    steps.push_back(prepare(
-        runtime,
-        metal::emitDecoderCacheAppend(plan, sequenceLength, false,
-                                      prefix + "value_cache_append"),
-        {value, states[index]->lengthBuffer()},
-        {metal::ElementType::Float32, metal::ElementType::Int32},
-        states[index]->valueBuffer(), metal::ElementType::Float32, log));
-    steps.push_back(prepare(
-        runtime, metal::emitKVAttention(plan.attention, sequenceLength, true),
-        {rotatedQuery, states[index]->keyBuffer(), states[index]->valueBuffer(),
-         states[index]->lengthBuffer()},
-        {metal::ElementType::Float32, metal::ElementType::Float32,
-         metal::ElementType::Float32, metal::ElementType::Int32},
-        context, metal::ElementType::Float32, log));
+    if (states[index]->isPaged()) {
+      steps.push_back(prepare(
+          runtime,
+          metal::emitDecoderPagedCacheAppend(
+              plan, sequenceLength, true, states[index]->pageSize(),
+              prefix + "key_cache_append"),
+          {rotatedKey, states[index]->lengthBuffer(),
+           states[index]->blockTableBuffer()},
+          {metal::ElementType::Float32, metal::ElementType::Int32,
+           metal::ElementType::Int32},
+          states[index]->keyBuffer(), metal::ElementType::Float32, log));
+      steps.push_back(prepare(
+          runtime,
+          metal::emitDecoderPagedCacheAppend(
+              plan, sequenceLength, false, states[index]->pageSize(),
+              prefix + "value_cache_append"),
+          {value, states[index]->lengthBuffer(),
+           states[index]->blockTableBuffer()},
+          {metal::ElementType::Float32, metal::ElementType::Int32,
+           metal::ElementType::Int32},
+          states[index]->valueBuffer(), metal::ElementType::Float32, log));
+      steps.push_back(prepare(
+          runtime,
+          metal::emitPagedKVAttention(plan.attention, sequenceLength,
+                                      states[index]->pageSize(), true),
+          {rotatedQuery, states[index]->keyBuffer(),
+           states[index]->valueBuffer(), states[index]->lengthBuffer(),
+           states[index]->blockTableBuffer()},
+          {metal::ElementType::Float32, metal::ElementType::Float32,
+           metal::ElementType::Float32, metal::ElementType::Int32,
+           metal::ElementType::Int32},
+          context, metal::ElementType::Float32, log));
+    } else {
+      steps.push_back(prepare(
+          runtime,
+          metal::emitDecoderCacheAppend(plan, sequenceLength, true,
+                                        prefix + "key_cache_append"),
+          {rotatedKey, states[index]->lengthBuffer()},
+          {metal::ElementType::Float32, metal::ElementType::Int32},
+          states[index]->keyBuffer(), metal::ElementType::Float32, log));
+      steps.push_back(prepare(
+          runtime,
+          metal::emitDecoderCacheAppend(plan, sequenceLength, false,
+                                        prefix + "value_cache_append"),
+          {value, states[index]->lengthBuffer()},
+          {metal::ElementType::Float32, metal::ElementType::Int32},
+          states[index]->valueBuffer(), metal::ElementType::Float32, log));
+      steps.push_back(prepare(
+          runtime, metal::emitKVAttention(plan.attention, sequenceLength, true),
+          {rotatedQuery, states[index]->keyBuffer(),
+           states[index]->valueBuffer(), states[index]->lengthBuffer()},
+          {metal::ElementType::Float32, metal::ElementType::Float32,
+           metal::ElementType::Float32, metal::ElementType::Int32},
+          context, metal::ElementType::Float32, log));
+    }
     addLinear(hidden, hidden, choices.hiddenToHidden, prefix + "attention_output",
               context, layer.outputWeight, attentionOutput);
     if (!(batch==1 && hidden==64 && plan.rmsNormEpsilon==1e-5f &&
@@ -396,6 +430,9 @@ public:
   KernelRegistry registry;
   DecoderStage prefillStage;
   DecoderStage decodeStage;
+  std::unique_ptr<DecoderStage> prefillChunkStage;
+  std::unique_ptr<DecoderStage> prefillTailStage;
+  std::size_t configuredChunkSize = 0;
 
   [[nodiscard]] std::size_t currentLength() const noexcept {
     return states.empty() ? 0 : states.front()->currentLength();
@@ -419,17 +456,24 @@ public:
     for (auto &state : states) {
       error = state->stageLength(*runtime, nextLength);
       if (!error.empty()) {
+        for (auto &stagedState : states) {
+          (void)stagedState->rollbackLength(*runtime, previousLength);
+        }
         result.errorMessage = error;
         return result;
       }
     }
     const auto execution = stage.sequence->execute();
     if (!execution.executionPassed) {
-      const float previous = static_cast<float>(previousLength);
+      std::string rollbackError;
       for (auto &state : states) {
-        (void)runtime->writeBuffer(state->lengthBuffer(), &previous, 1);
+        const auto stateError = state->rollbackLength(*runtime, previousLength);
+        if (rollbackError.empty()) rollbackError = stateError;
       }
       result.errorMessage = execution.errorMessage;
+      if (!rollbackError.empty()) {
+        result.errorMessage += " KV cache rollback failed: " + rollbackError;
+      }
       return result;
     }
     for (auto &state : states) state->commitLength(nextLength);
@@ -468,6 +512,61 @@ CompiledDecoderLLM::prefill(const std::vector<float> &tokenIds) {
   }
   return impl_->run(impl_->prefillStage, impl_->plan.attention.prefillLength,
                     tokenIds);
+}
+
+DecoderLLMRunResult
+CompiledDecoderLLM::prefillChunked(const std::vector<float> &tokenIds) {
+  DecoderLLMRunResult result;
+  if (currentLength() != 0) {
+    result.errorMessage =
+        "Chunked decoder prefill requires an empty cache; call reset first.";
+    return result;
+  }
+  if (!impl_->prefillChunkStage || impl_->configuredChunkSize == 0) {
+    result.errorMessage = "Chunked decoder prefill was not compiled.";
+    return result;
+  }
+  const auto expected = impl_->plan.attention.inputElementCount(
+      impl_->plan.attention.prefillLength) / impl_->plan.hiddenSize();
+  if (tokenIds.size() != expected) {
+    result.errorMessage =
+        "Chunked decoder token input shape does not match the prefill plan.";
+    return result;
+  }
+
+  bool hasGpuTiming = true;
+  double gpuTime = 0.0;
+  for (std::size_t offset = 0; offset < tokenIds.size();) {
+    const auto count = std::min(impl_->configuredChunkSize,
+                                tokenIds.size() - offset);
+    DecoderStage *stage = impl_->prefillChunkStage.get();
+    if (count != impl_->configuredChunkSize) {
+      stage = impl_->prefillTailStage.get();
+    }
+    if (stage == nullptr || stage->sequenceLength != count) {
+      result.errorMessage = "Missing compiled stage for the final prefill chunk.";
+      return result;
+    }
+    const std::vector<float> chunk(
+        tokenIds.begin() + static_cast<std::ptrdiff_t>(offset),
+        tokenIds.begin() + static_cast<std::ptrdiff_t>(offset + count));
+    auto chunkResult = impl_->run(*stage, currentLength() + count, chunk);
+    if (!chunkResult.passed) return chunkResult;
+    result.logits.insert(result.logits.end(), chunkResult.logits.begin(),
+                         chunkResult.logits.end());
+    result.nextTokenIds = std::move(chunkResult.nextTokenIds);
+    result.cpuSubmitToCompletionTimeUs +=
+        chunkResult.cpuSubmitToCompletionTimeUs;
+    if (chunkResult.gpuExecutionTimeUs) {
+      gpuTime += *chunkResult.gpuExecutionTimeUs;
+    } else {
+      hasGpuTiming = false;
+    }
+    offset += count;
+  }
+  if (hasGpuTiming) result.gpuExecutionTimeUs = gpuTime;
+  result.passed = true;
+  return result;
 }
 
 DecoderLLMRunResult
@@ -511,6 +610,30 @@ bool CompiledDecoderLLM::cacheStorageReused() const noexcept {
   return true;
 }
 
+bool CompiledDecoderLLM::usesPagedKVCache() const noexcept {
+  return !impl_->states.empty() && impl_->states.front()->isPaged();
+}
+
+std::size_t CompiledDecoderLLM::kvPageSize() const noexcept {
+  return usesPagedKVCache() ? impl_->states.front()->pageSize() : 0;
+}
+
+std::size_t CompiledDecoderLLM::prefillChunkSize() const noexcept {
+  return impl_->configuredChunkSize;
+}
+
+std::size_t CompiledDecoderLLM::allocatedKVPageCount() const noexcept {
+  return usesPagedKVCache() ? impl_->states.front()->allocatedPageCount() : 0;
+}
+
+std::vector<std::int32_t>
+CompiledDecoderLLM::kvBlockTable(std::size_t layer) const {
+  if (layer >= impl_->states.size()) {
+    throw std::out_of_range("Decoder layer index is out of range.");
+  }
+  return impl_->states[layer]->pageTable();
+}
+
 void CompiledDecoderLLM::resetKernelUsage() noexcept {
   impl_->registry.resetUsage();
 }
@@ -521,7 +644,7 @@ void CompiledDecoderLLM::reportKernelUsage(std::ostream &log) const {
 
 DecoderLLMCompilation compileDecoderLLM(
     metal::MetalRuntime &runtime, const DecoderLLMWorkload &workload,
-    std::ostream &log, const std::string &kernelLibrary) {
+    std::ostream &log, const DecoderLLMCompileOptions &options) {
   DecoderLLMCompilation result;
   try {
     workload.plan.validate();
@@ -531,6 +654,20 @@ DecoderLLMCompilation compileDecoderLLM(
     if (workload.layers.size() != workload.plan.layerCount) {
       throw std::invalid_argument(
           "Decoder layer parameters do not match the plan.");
+    }
+    if (options.kvPageSize != 0 && workload.plan.attention.batch != 1) {
+      throw std::invalid_argument(
+          "Paged decoder execution currently supports one request.");
+    }
+    if (options.prefillChunkSize != 0) {
+      if (options.kvPageSize == 0) {
+        throw std::invalid_argument(
+            "Chunked prefill requires paged KV cache execution.");
+      }
+      if (options.prefillChunkSize >= workload.plan.attention.prefillLength) {
+        throw std::invalid_argument(
+            "Prefill chunk size must be smaller than the full prefill length.");
+      }
     }
 
     const auto &plan = workload.plan;
@@ -563,7 +700,7 @@ DecoderLLMCompilation compileDecoderLLM(
     auto impl = std::make_unique<CompiledDecoderLLM::Impl>();
     impl->runtime = &runtime;
     impl->plan = plan;
-    impl->registry.load(runtime,kernelLibrary,log);
+    impl->registry.load(runtime, options.kernelLibrary, log);
     impl->embeddingWeight = allocate(runtime, workload.embeddingWeight.size(),
                                      workload.embeddingWeight.data());
     impl->finalNormWeight = allocate(runtime, workload.finalNormWeight.size(),
@@ -577,19 +714,41 @@ DecoderLLMCompilation compileDecoderLLM(
                               workload.ropeSine.data());
     for (const auto &parameters : workload.layers) {
       impl->layers.push_back(allocateLayer(runtime, parameters));
-      auto state = createKVCacheState(runtime, plan.attention);
+      auto state = createKVCacheState(runtime, plan.attention,
+                                      options.kvPageSize);
       if (!state.state) throw std::runtime_error(state.errorMessage);
       impl->states.push_back(std::move(state.state));
     }
 
     impl->prefillStage = buildStage(
-        runtime, workload, plan.attention.prefillLength, impl->embeddingWeight,
-        impl->finalNormWeight, impl->languageModelHeadWeight, impl->ropeCosine,
-        impl->ropeSine, impl->layers, impl->states, choices, impl->registry, log);
-    impl->decodeStage = buildStage(
-        runtime, workload, 1, impl->embeddingWeight, impl->finalNormWeight,
+        runtime, workload, plan.attention.prefillLength, "prefill",
+        impl->embeddingWeight, impl->finalNormWeight,
         impl->languageModelHeadWeight, impl->ropeCosine, impl->ropeSine,
         impl->layers, impl->states, choices, impl->registry, log);
+    impl->decodeStage = buildStage(
+        runtime, workload, 1, "decode", impl->embeddingWeight,
+        impl->finalNormWeight, impl->languageModelHeadWeight, impl->ropeCosine,
+        impl->ropeSine, impl->layers, impl->states, choices, impl->registry,
+        log);
+    if (options.prefillChunkSize != 0) {
+      impl->configuredChunkSize = options.prefillChunkSize;
+      impl->prefillChunkStage = std::make_unique<DecoderStage>(buildStage(
+          runtime, workload, options.prefillChunkSize,
+          "prefill_chunk_" + std::to_string(options.prefillChunkSize),
+          impl->embeddingWeight, impl->finalNormWeight,
+          impl->languageModelHeadWeight, impl->ropeCosine, impl->ropeSine,
+          impl->layers, impl->states, choices, impl->registry, log));
+      const auto tail =
+          plan.attention.prefillLength % options.prefillChunkSize;
+      if (tail != 0) {
+        impl->prefillTailStage = std::make_unique<DecoderStage>(buildStage(
+            runtime, workload, tail,
+            "prefill_chunk_" + std::to_string(tail), impl->embeddingWeight,
+            impl->finalNormWeight, impl->languageModelHeadWeight,
+            impl->ropeCosine, impl->ropeSine, impl->layers, impl->states,
+            choices, impl->registry, log));
+      }
+    }
     result.executable = std::unique_ptr<CompiledDecoderLLM>(
         new CompiledDecoderLLM(std::move(impl)));
     log << "Decoder-only stateful compilation: PASS\n";

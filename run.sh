@@ -15,8 +15,8 @@ REQUEST="$BUILD_DIR/advisor_request.json"
 RESPONSE="$BUILD_DIR/advisor_response.json"
 COMPILER="$BUILD_DIR/TensorMetalCompiler"
 
-if [[ "$MODE" != "advisor" && "$MODE" != "generate" && "$MODE" != "decode" && "$MODE" != "decoder-llm" && "$MODE" != "benchmark" && "$MODE" != "ablation" && "$MODE" != "regression" ]]; then
-  echo "Usage: ./run.sh [advisor|generate [pattern|decoder-all]|decode|decoder-llm|benchmark|ablation|regression]" >&2
+if [[ "$MODE" != "advisor" && "$MODE" != "generate" && "$MODE" != "decode" && "$MODE" != "decoder-llm" && "$MODE" != "paged-kv" && "$MODE" != "benchmark" && "$MODE" != "ablation" && "$MODE" != "regression" ]]; then
+  echo "Usage: ./run.sh [advisor|generate [pattern|decoder-all]|decode|decoder-llm|paged-kv|benchmark|ablation|regression]" >&2
   exit 1
 fi
 
@@ -98,6 +98,15 @@ case "$MODE" in
     "$COMPILER" --decoder-llm "$DECODER_LLM_MANIFEST" \
       --kernel-library "$BUILD_DIR/generated_kernels"
     ;;
+  paged-kv)
+    "$PYTHON" "$ROOT/tools/export_decoder_llm.py" \
+      --output "$DECODER_LLM_MANIFEST"
+
+    "$COMPILER" --paged-kv "$DECODER_LLM_MANIFEST" \
+      --page-size 4 \
+      --chunk-size 3 \
+      --kernel-library "$BUILD_DIR/generated_kernels"
+    ;;
   benchmark)
     "$PYTHON" "$ROOT/tools/export_decoder_llm.py" \
       --output "$DECODER_LLM_MANIFEST"
@@ -167,6 +176,12 @@ case "$MODE" in
     "$PYTHON" "$ROOT/tools/export_decoder_llm.py" \
       --output "$DECODER_LLM_MANIFEST"
     "$COMPILER" --decoder-llm "$DECODER_LLM_MANIFEST" \
+      --kernel-library "$BUILD_DIR/generated_kernels"
+
+    echo "Regression: chunked prefill and paged KV cache"
+    "$COMPILER" --paged-kv "$DECODER_LLM_MANIFEST" \
+      --page-size 4 \
+      --chunk-size 3 \
       --kernel-library "$BUILD_DIR/generated_kernels"
 
     echo "Regression: PASS"

@@ -14,6 +14,8 @@ AICompiler/
 │   ├── main.cpp
 │   ├── kv_cache_main.cpp
 │   ├── kv_cache_main.hpp
+│   ├── paged_kv_main.cpp
+│   ├── paged_kv_main.hpp
 │   ├── pytorch_import_main.cpp
 │   ├── pytorch_import_main.hpp
 │   ├── tensor_graph_examples.cpp
@@ -275,5 +277,18 @@ Generation uses the same remote Workflow for all six patterns. Decoder execution
 ./run.sh ablation
 ./run.sh regression
 ```
+
+### Chunked prefill and paged KV cache
+
+- Adds a single-request paged KV layout with fixed token pages, a logical-to-physical block table, incremental page allocation, reset, and safe capacity rejection.
+- Compiles reusable Metal append and causal-attention kernels that translate logical token positions through the block table.
+- Runs the decoder prefill in three-token chunks across four-token page boundaries, then continues single-token decode on the same cache.
+- Reconstructs logical K/V prefixes for validation against the existing PyTorch reference and checks full-capacity overflow without changing cache state.
+
+```bash
+./run.sh paged-kv
+```
+
+This stage intentionally covers one request. Continuous batching, preemption, and multi-request page scheduling remain in the following serving stage.
 
 AgentCompile evaluates CUDA/A800 mechanisms. This project evaluates the corresponding compiler and runtime principles on Apple M3 Pro, Metal, and unified memory; the reported measurements describe these Metal implementations.

@@ -20,6 +20,11 @@ emitKVAttention(const planner::KVCachePlan &plan,
                 std::size_t queryLength, bool causalPrefill = false);
 
 [[nodiscard]] GeneratedKernel
+emitPagedKVAttention(const planner::KVCachePlan &plan,
+                     std::size_t queryLength, std::size_t pageSize,
+                     bool causalPrefill = false);
+
+[[nodiscard]] GeneratedKernel
 emitKVOutputProjection(const planner::KVCachePlan &plan,
                        std::size_t queryLength);
 

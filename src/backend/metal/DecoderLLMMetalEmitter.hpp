@@ -24,6 +24,11 @@ namespace tensor::metal {
     const planner::DecoderLLMPlan &plan, std::size_t sequenceLength,
     bool inputIsHeadMajor, const std::string &functionName);
 
+[[nodiscard]] GeneratedKernel emitDecoderPagedCacheAppend(
+    const planner::DecoderLLMPlan &plan, std::size_t sequenceLength,
+    bool inputIsHeadMajor, std::size_t pageSize,
+    const std::string &functionName);
+
 [[nodiscard]] GeneratedKernel emitDecoderAdd(
     std::size_t elementCount, std::size_t threads,
     const std::string &functionName);
