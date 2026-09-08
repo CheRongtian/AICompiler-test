@@ -1,4 +1,5 @@
 #include "backend/metal/MetalRuntime.hpp"
+#include "decoder_llm_main.hpp"
 #include "generated_kernel_main.hpp"
 #include "kv_cache_main.hpp"
 #include "pytorch_import_main.hpp"
@@ -128,6 +129,9 @@ int main(int argc, char **argv) {
     if (argc == 3 && std::string(argv[1]) == "--transformer-decode") {
       return runTransformerDecodeWorkload(runtime, argv[2], std::cout) ? 0 : 1;
     }
+    if (argc == 3 && std::string(argv[1]) == "--decoder-llm") {
+      return runDecoderLLMWorkload(runtime, argv[2], std::cout) ? 0 : 1;
+    }
     if (argc == 3 && std::string(argv[1]) == "--emit-kernel-contract") {
       return emitGeneratedKernelContract(runtime, argv[2], std::cout) ? 0 : 1;
     }
@@ -144,6 +148,7 @@ int main(int argc, char **argv) {
                    " [--import-pytorch <graph-manifest> --advisor-response <json>]"
                    " [--kv-cache <cache-manifest>]"
                    " [--transformer-decode <decoder-manifest>]"
+                   " [--decoder-llm <decoder-manifest>]"
                    " [--emit-kernel-contract <json>]"
                    " [--admit-generated-kernel <json> --feedback-output <json>]\n";
       return 1;

@@ -7,6 +7,8 @@ AICompiler/
 ├── apps/
 │   ├── generated_kernel_main.cpp
 │   ├── generated_kernel_main.hpp
+│   ├── decoder_llm_main.cpp
+│   ├── decoder_llm_main.hpp
 │   ├── main.cpp
 │   ├── kv_cache_main.cpp
 │   ├── kv_cache_main.hpp
@@ -25,6 +27,8 @@ AICompiler/
 │   │   ├── FusionMetalEmitter.cpp
 │   │   ├── GraphMetalEmitter.cpp
 │   │   ├── KVCacheMetalEmitter.*
+│   │   ├── DecodeGEMVMetalEmitter.*
+│   │   ├── DecoderLLMMetalEmitter.*
 │   │   ├── MetalEmitter.*
 │   │   ├── MetalRuntime.*
 │   │   ├── RMSNormBaseline.cpp
@@ -33,6 +37,7 @@ AICompiler/
 │   │   └── Benchmark.*
 │   ├── importer/
 │   │   ├── KVCacheImporter.*
+│   │   ├── DecoderLLMImporter.*
 │   │   ├── PyTorchImporter.*
 │   │   └── TransformerDecodeImporter.*
 │   ├── llm/
@@ -41,18 +46,22 @@ AICompiler/
 │   │   └── KernelContract.*
 │   ├── planner/
 │   │   ├── KernelPlan.*
+│   │   ├── DecodeGEMVTuner.*
+│   │   ├── DecoderLLMPlan.*
 │   │   ├── KVCachePlan.*
 │   │   ├── RegionPlan.*
 │   │   ├── RMSNormTuner.*
 │   │   └── TransformerDecodePlan.*
 │   ├── runtime/
 │   │   ├── GeneratedKernelAdmission.*
+│   │   ├── DecoderLLMExecutor.*
 │   │   ├── GraphExecutor.*
 │   │   ├── KVCacheState.*
 │   │   ├── StatefulExecutor.*
 │   │   └── TransformerDecodeExecutor.*
 │   ├── tensor/
 │   │   ├── TensorIR.*
+│   │   ├── DecoderLLM.hpp
 │   │   └── TransformerDecode.hpp
 │   ├── validation/
 │   │   ├── GraphReference.*
@@ -68,9 +77,11 @@ AICompiler/
 │   ├── transformer.py
 │   ├── KVCache.py
 │   ├── MOE.py
+│   ├── decoder_llm.py
 │   └── transformer_kv_benchmark.py
 ├── tools/
 │   ├── export_kv_cache.py
+│   ├── export_decoder_llm.py
 │   ├── export_transformer_decode.py
 │   ├── llm_advisor.py
 │   ├── llm_kernel_generator.py
@@ -205,3 +216,15 @@ Copy `prompts/metal_kernel_generator_zh.md` or `prompts/metal_kernel_generator_e
 ```
 
 This workload follows the current PyTorch model's sinusoidal positional encoding, LayerNorm, cross-attention, and ReLU FFN semantics. RoPE, RMSNorm, and gated MLP remain available for a later decoder-only LLM workload.
+
+### Decoder-only LLM and Decode GEMV
+
+- Adds a two-layer decoder-only PyTorch workload with pre-norm RMSNorm, interleaved RoPE, causal self-attention, SwiGLU, LM head, and autoregressive token feedback.
+- Imports fixed fp32 parameters and PyTorch references for an 8-token prefill followed by eight single-token decode steps.
+- Keeps one fixed-capacity K/V cache per layer and compiles reusable prefill and decode Metal command sequences.
+- Autotunes Decode GEMV candidates for each Linear shape and admits candidates only after hardware, interface, numerical, warmup, and paired performance checks; prefill uses the generic Linear kernel.
+- Validates logits, generated tokens, every logical cache prefix, cache length, and cache storage reuse.
+
+```bash
+./run.sh decoder-llm
+```

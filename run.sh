@@ -8,12 +8,13 @@ PYTHON="$ROOT/.venv_ai_compiler/bin/python3"
 BUILD_DIR="$ROOT/build"
 MANIFEST="$BUILD_DIR/transformer.tmc"
 DECODE_MANIFEST="$BUILD_DIR/transformer_decode.tmc"
+DECODER_LLM_MANIFEST="$BUILD_DIR/decoder_llm.tmc"
 REQUEST="$BUILD_DIR/advisor_request.json"
 RESPONSE="$BUILD_DIR/advisor_response.json"
 COMPILER="$BUILD_DIR/TensorMetalCompiler"
 
-if [[ "$MODE" != "advisor" && "$MODE" != "generate" && "$MODE" != "decode" ]]; then
-  echo "Usage: ./run.sh [advisor|generate|decode]" >&2
+if [[ "$MODE" != "advisor" && "$MODE" != "generate" && "$MODE" != "decode" && "$MODE" != "decoder-llm" ]]; then
+  echo "Usage: ./run.sh [advisor|generate|decode|decoder-llm]" >&2
   exit 1
 fi
 
@@ -78,5 +79,11 @@ case "$MODE" in
       --output "$DECODE_MANIFEST"
 
     "$COMPILER" --transformer-decode "$DECODE_MANIFEST"
+    ;;
+  decoder-llm)
+    "$PYTHON" "$ROOT/tools/export_decoder_llm.py" \
+      --output "$DECODER_LLM_MANIFEST"
+
+    "$COMPILER" --decoder-llm "$DECODER_LLM_MANIFEST"
     ;;
 esac

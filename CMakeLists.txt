@@ -65,6 +65,8 @@ endif()
 
 add_executable(TensorMetalCompiler
   apps/tensor_metal_main.cpp
+  apps/decoder_llm_main.hpp
+  apps/decoder_llm_main.cpp
   apps/generated_kernel_main.hpp
   apps/generated_kernel_main.cpp
   apps/kv_cache_main.hpp
@@ -89,6 +91,10 @@ add_executable(TensorMetalCompiler
   src/planner/KVCachePlan.cpp
   src/planner/TransformerDecodePlan.hpp
   src/planner/TransformerDecodePlan.cpp
+  src/planner/DecoderLLMPlan.hpp
+  src/planner/DecoderLLMPlan.cpp
+  src/planner/DecodeGEMVTuner.hpp
+  src/planner/DecodeGEMVTuner.cpp
   src/llm/AdvisorProtocol.hpp
   src/llm/AdvisorProtocol.cpp
   src/llm/KernelContract.hpp
@@ -103,6 +109,10 @@ add_executable(TensorMetalCompiler
   src/backend/metal/KVCacheMetalEmitter.cpp
   src/backend/metal/TransformerDecodeMetalEmitter.hpp
   src/backend/metal/TransformerDecodeMetalEmitter.cpp
+  src/backend/metal/DecoderLLMMetalEmitter.hpp
+  src/backend/metal/DecoderLLMMetalEmitter.cpp
+  src/backend/metal/DecodeGEMVMetalEmitter.hpp
+  src/backend/metal/DecodeGEMVMetalEmitter.cpp
   src/backend/metal/RMSNormBaseline.cpp
   src/backend/metal/MetalRuntime.hpp
   src/backend/metal/MetalRuntime.mm
@@ -120,13 +130,18 @@ add_executable(TensorMetalCompiler
   src/runtime/GeneratedKernelAdmission.cpp
   src/runtime/TransformerDecodeExecutor.hpp
   src/runtime/TransformerDecodeExecutor.cpp
+  src/runtime/DecoderLLMExecutor.hpp
+  src/runtime/DecoderLLMExecutor.cpp
   src/importer/PyTorchImporter.hpp
   src/importer/PyTorchImporter.cpp
   src/importer/KVCacheImporter.hpp
   src/importer/KVCacheImporter.cpp
   src/importer/TransformerDecodeImporter.hpp
   src/importer/TransformerDecodeImporter.cpp
+  src/importer/DecoderLLMImporter.hpp
+  src/importer/DecoderLLMImporter.cpp
   src/tensor/TransformerDecode.hpp
+  src/tensor/DecoderLLM.hpp
   src/benchmark/Benchmark.hpp
   src/benchmark/Benchmark.cpp
   src/planner/RMSNormTuner.hpp
