@@ -98,22 +98,37 @@ std::string checkFloatBufferInterface(const ComputePipelineResult &pipeline,
 std::string checkBufferInterface(const ComputePipelineResult &pipeline,
                                  const std::vector<ElementType> &inputs,
                                  ElementType output) {
-  if (!pipeline.reflectionAvailable || pipeline.bindings.size() != inputs.size() + 1) {
+  return checkBufferInterface(pipeline, inputs, std::vector<ElementType>{output});
+}
+
+std::string checkBufferInterface(const ComputePipelineResult &pipeline,
+                                 const std::vector<ElementType> &inputs,
+                                 const std::vector<ElementType> &outputs,
+                                 bool uintConstants) {
+  const auto bufferCount = inputs.size() + outputs.size();
+  if (outputs.empty() || !pipeline.reflectionAvailable ||
+      pipeline.bindings.size() != bufferCount + uintConstants) {
     return "Reflection must contain exactly the expected input and output buffers.";
   }
-  std::vector<bool> seen(inputs.size() + 1, false);
+  std::vector<bool> seen(bufferCount + uintConstants, false);
   for (const auto &binding : pipeline.bindings) {
     if (!binding.isBuffer || binding.index >= seen.size() || seen[binding.index]) {
       return "Expected unique buffer bindings at consecutive indices.";
     }
     seen[binding.index] = true;
-    const auto expected = binding.index < inputs.size() ? inputs[binding.index] : output;
+    if (binding.index == bufferCount) {
+      if (!binding.isUInt32 || !binding.readOnly)
+        return "Expected a read-only uint32 constants binding.";
+      continue;
+    }
+    const auto expected = binding.index < inputs.size()
+        ? inputs[binding.index] : outputs[binding.index - inputs.size()];
     const bool typeMatches = expected == ElementType::Float32 ? binding.isFloat32
                            : expected == ElementType::Float16 ? binding.isFloat16
                                                               : binding.isInt32;
     if (!typeMatches) return "Reflected buffer element type disagrees with TensorIR.";
     if ((binding.index < inputs.size() && !binding.readOnly) ||
-        (binding.index == inputs.size() && !binding.writable)) {
+        (binding.index >= inputs.size() && !binding.writable)) {
       return "Expected read-only inputs and a writable output buffer.";
     }
   }
@@ -150,9 +165,7 @@ public:
   id<MTLCommandQueue> queue = nil;
   id<MTLComputePipelineState> pipeline = nil;
   std::vector<id<MTLBuffer>> inputs;
-  id<MTLBuffer> output = nil;
-  std::size_t outputElementCount = 0;
-  ElementType outputType = ElementType::Float32;
+  std::vector<BufferHandle> outputs;
   DispatchSize dispatch;
   std::vector<std::uint32_t> constants;
 
@@ -160,13 +173,17 @@ public:
     ExecutionResult result;
     @autoreleasepool {
       if (readback) {
-        if (outputType == ElementType::Float32) {
-          std::fill_n(static_cast<float *>(output.contents), outputElementCount,
-                      std::numeric_limits<float>::quiet_NaN());
-        } else if (outputType == ElementType::Float16) {
-          std::fill_n(static_cast<std::uint16_t *>(output.contents), outputElementCount, 0x7e00u);
-        } else {
-          std::fill_n(static_cast<std::int32_t *>(output.contents), outputElementCount, 0);
+        for (const auto &buffer : outputs) {
+          auto output = buffer->impl_->buffer;
+          const auto count = buffer->elementCount();
+          if (buffer->elementType() == ElementType::Float32)
+            std::fill_n(static_cast<float *>(output.contents), count,
+                        std::numeric_limits<float>::quiet_NaN());
+          else if (buffer->elementType() == ElementType::Float16)
+            std::fill_n(static_cast<std::uint16_t *>(output.contents), count, 0x7e00u);
+          else
+            std::fill_n(static_cast<std::int32_t *>(output.contents), count,
+                        std::numeric_limits<std::int32_t>::min());
         }
       }
       id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
@@ -183,11 +200,13 @@ public:
       for (std::size_t index = 0; index < inputs.size(); ++index) {
         [encoder setBuffer:inputs[index] offset:0 atIndex:index];
       }
-      [encoder setBuffer:output offset:0 atIndex:inputs.size()];
+      for (std::size_t i = 0; i < outputs.size(); ++i) {
+        [encoder setBuffer:outputs[i]->impl_->buffer offset:0 atIndex:inputs.size() + i];
+      }
       if (!constants.empty()) {
         [encoder setBytes:constants.data()
                   length:constants.size() * sizeof(std::uint32_t)
-                 atIndex:inputs.size() + 1];
+                 atIndex:inputs.size() + outputs.size()];
       }
       [encoder dispatchThreadgroups:MTLSizeMake(dispatch.threadgroupCount, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(dispatch.threadsPerThreadgroup, 1, 1)];
@@ -211,17 +230,7 @@ public:
         result.gpuExecutionTimeUs = (gpuEnd - gpuStart) * 1e6;
       }
       if (readback) {
-        result.output.resize(outputElementCount);
-        if (outputType == ElementType::Float32) {
-          std::memcpy(result.output.data(), output.contents,
-                      outputElementCount * sizeof(float));
-        } else if (outputType == ElementType::Float16) {
-          const auto *source = static_cast<const std::uint16_t *>(output.contents);
-          for (std::size_t i = 0; i < outputElementCount; ++i) result.output[i] = halfToFloat(source[i]);
-        } else {
-          const auto *source = static_cast<const std::int32_t *>(output.contents);
-          for (std::size_t i = 0; i < outputElementCount; ++i) result.output[i] = static_cast<float>(source[i]);
-        }
+        result.output = outputs.front()->read();
       }
       result.executionPassed = true;
     }
@@ -234,13 +243,18 @@ PreparedExecution::PreparedExecution(std::unique_ptr<Impl> impl)
 PreparedExecution::~PreparedExecution() = default;
 ExecutionResult PreparedExecution::run() const { return impl_->execute(true); }
 ExecutionResult PreparedExecution::execute() const { return impl_->execute(false); }
+std::vector<std::vector<float>> PreparedExecution::readOutputs() const {
+  std::vector<std::vector<float>> result;
+  for (const auto &output : impl_->outputs) result.push_back(output->read());
+  return result;
+}
 
 class PreparedSequence::Impl {
 public:
   struct Step {
     id<MTLComputePipelineState> pipeline = nil;
     std::vector<id<MTLBuffer>> inputs;
-    id<MTLBuffer> output = nil;
+    std::vector<id<MTLBuffer>> outputs;
     DispatchSize dispatch;
     std::vector<std::uint32_t> constants;
   };
@@ -266,11 +280,13 @@ public:
         for (std::size_t index = 0; index < step.inputs.size(); ++index) {
           [encoder setBuffer:step.inputs[index] offset:0 atIndex:index];
         }
-        [encoder setBuffer:step.output offset:0 atIndex:step.inputs.size()];
+        for (std::size_t i = 0; i < step.outputs.size(); ++i) {
+          [encoder setBuffer:step.outputs[i] offset:0 atIndex:step.inputs.size() + i];
+        }
         if (!step.constants.empty()) {
           [encoder setBytes:step.constants.data()
                     length:step.constants.size() * sizeof(std::uint32_t)
-                   atIndex:step.inputs.size() + 1];
+                   atIndex:step.inputs.size() + step.outputs.size()];
         }
         [encoder dispatchThreadgroups:MTLSizeMake(step.dispatch.threadgroupCount, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(step.dispatch.threadsPerThreadgroup, 1, 1)];
@@ -510,7 +526,7 @@ public:
   }
 
   PreparationResult prepareBuffers(const std::vector<BufferHandle> &inputs,
-                                     const BufferHandle &output,
+                                     const std::vector<BufferHandle> &outputs,
                                      const DispatchSize &dispatch,
                                      const std::vector<std::uint32_t> &constants) const {
     PreparationResult result;
@@ -523,8 +539,8 @@ public:
         result.errorMessage = "Create a compute pipeline before execution.";
         return result;
       }
-      const auto bindingCount = inputs.size() + 1 + !constants.empty();
-      if (inputs.empty() || bindingCount > 31 || constants.size() > 1024) {
+      const auto bindingCount = inputs.size() + outputs.size() + !constants.empty();
+      if (inputs.empty() || outputs.empty() || bindingCount > 31 || constants.size() > 1024) {
         result.errorMessage = "Invalid buffer binding count or oversized inline constants.";
         return result;
       }
@@ -537,21 +553,24 @@ public:
         result.errorMessage = "Kernel dispatch exceeds device or pipeline limits.";
         return result;
       }
-      if (!output || output->impl_->buffer.device != device_) {
-        result.errorMessage = "Output buffer is missing or belongs to another device.";
-        return result;
-      }
       auto prepared = std::make_unique<PreparedExecution::Impl>();
       prepared->queue = commandQueue_;
       prepared->pipeline = pipeline_;
       prepared->dispatch = dispatch;
       prepared->constants = constants;
-      prepared->outputElementCount = output->elementCount();
-      prepared->outputType = output->elementType();
-      prepared->output = output->impl_->buffer;
+      for (std::size_t i = 0; i < outputs.size(); ++i) {
+        const auto &output = outputs[i];
+        if (!output || output->impl_->buffer.device != device_ ||
+            std::find(outputs.begin(), outputs.begin() + i, output) != outputs.begin() + i) {
+          result.errorMessage = "Outputs must be distinct buffers on the current device.";
+          return result;
+        }
+        prepared->outputs.push_back(output);
+      }
       for (const auto &input : inputs) {
-        if (!input || input->impl_->buffer.device != device_ || input == output) {
-          result.errorMessage = "Input buffer is missing, on another device, or aliases output.";
+        if (!input || input->impl_->buffer.device != device_ ||
+            std::find(outputs.begin(), outputs.end(), input) != outputs.end()) {
+          result.errorMessage = "Input is missing, on another device, or aliases an output.";
           return result;
         }
         prepared->inputs.push_back(input->impl_->buffer);
@@ -575,7 +594,7 @@ public:
     }
     auto output = createBuffer(outputElementCount, nullptr, outputType);
     if (!output.buffer) return {nullptr, output.errorMessage};
-    return prepareBuffers(buffers, output.buffer, dispatch, constants);
+    return prepareBuffers(buffers, std::vector<BufferHandle>{output.buffer}, dispatch, constants);
   }
 
 private:
@@ -651,7 +670,14 @@ PreparationResult MetalRuntime::prepareBuffers(const std::vector<BufferHandle> &
                                                const BufferHandle &output,
                                                const DispatchSize &dispatch,
                                                const std::vector<std::uint32_t> &constants) const {
-  return impl_->prepareBuffers(inputs, output, dispatch, constants);
+  return impl_->prepareBuffers(inputs, std::vector<BufferHandle>{output}, dispatch, constants);
+}
+
+PreparationResult MetalRuntime::prepareBuffers(
+    const std::vector<BufferHandle> &inputs,
+    const std::vector<BufferHandle> &outputs, const DispatchSize &dispatch,
+    const std::vector<std::uint32_t> &constants) const {
+  return impl_->prepareBuffers(inputs, outputs, dispatch, constants);
 }
 
 SequencePreparationResult
@@ -676,7 +702,8 @@ MetalRuntime::prepareSequence(const std::vector<const PreparedExecution *> &step
     PreparedSequence::Impl::Step step;
     step.pipeline = execution->impl_->pipeline;
     step.inputs = execution->impl_->inputs;
-    step.output = execution->impl_->output;
+    for (const auto &output : execution->impl_->outputs)
+      step.outputs.push_back(output->impl_->buffer);
     step.dispatch = execution->impl_->dispatch;
     step.constants = execution->impl_->constants;
     sequence->steps.push_back(std::move(step));

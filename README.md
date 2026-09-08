@@ -42,6 +42,7 @@ AICompiler/
 │   │   └── TransformerDecodeImporter.*
 │   ├── llm/
 │   │   ├── AdvisorProtocol.*
+│   │   ├── DecoderKernelContracts.cpp
 │   │   ├── GeneratedKernelProtocol.*
 │   │   └── KernelContract.*
 │   ├── planner/
@@ -57,6 +58,7 @@ AICompiler/
 │   │   ├── DecoderLLMExecutor.*
 │   │   ├── GraphExecutor.*
 │   │   ├── KVCacheState.*
+│   │   ├── KernelRegistry.*
 │   │   ├── StatefulExecutor.*
 │   │   └── TransformerDecodeExecutor.*
 │   ├── tensor/
@@ -91,6 +93,8 @@ AICompiler/
 │   ├── metal_advisor_zh.md
 │   ├── metal_kernel_generator_en.md
 │   └── metal_kernel_generator_zh.md
+├── config/
+│   └── kernel_principles.json
 ├── docs/papers/
 │   └── 2606.07665v2.pdf
 ├── tests/models/
@@ -191,16 +195,23 @@ Copy either Advisor prompt under `prompts/` into the remote Advisor Agent config
 
 ### LLM-generated Metal kernel admission
 
-- Emits a strict fp32 SiLU + Mul kernel contract for `[1, 4096]` and `[3, 4097]`.
-- Sends the complete conversation history and repeats the immutable contract with compiler feedback on every retry.
-- Checks the generated function name, workgroup size, reflected Metal ABI, numerical output, and performance against the fastest measured template kernel.
-- Admits only candidates that reach 1.05x speedup in two paired rounds; otherwise retries up to three times and keeps the template fallback.
+- Uses compiler-owned fp32 contracts for SiLU + Mul and interleaved Q/K RoPE, including cases, buffer roles, constants, dispatch, and admission thresholds.
+- Reads `config/kernel_principles.json` at runtime. Every Workflow request carries the immutable contract, principles, all previous attempts, and compiler feedback.
+- Shares compilation, reflected ABI checks, per-output numerical/guard validation, warmup, and admission across patterns.
+- Selects a template baseline per case and requires at least 1.05x speedup in two paired rounds on every case; otherwise retries up to three times and keeps the template fallback.
 
 ```bash
 ./run.sh generate
+./run.sh generate rope
 ```
 
-Copy `prompts/metal_kernel_generator_zh.md` or `prompts/metal_kernel_generator_en.md` into the remote Kernel Generator Agent, then fill `TMC_LLM_KERNEL_GENERATOR_URL` and the shared `TMC_LLM_API_KEY` in `.env`. Admitted source is stored under `build/generated_kernels/`; failed candidates remain outside the admitted artifact.
+Copy either updated `prompts/metal_kernel_generator_zh.md` or `prompts/metal_kernel_generator_en.md` into the shared remote Kernel Generator Workflow. Configure `TMC_LLM_KERNEL_GENERATOR_URL` and `TMC_LLM_API_KEY` in `.env`. Prompts stay on the Workflow; Python sends runtime data only. Remote memory is unnecessary. Requests are stored under `build/generated_kernels/<pattern>/`; the compiler writes `admitted.json` only after all admission checks pass. A failed generation preserves any existing admitted artifact.
+
+### Multi-output Metal execution
+
+- Binds consecutive input buffers, output buffers, and optional packed uint32 constants.
+- Supports typed multi-output interface checking, reusable PreparedExecution/PreparedSequence, and readback of all outputs.
+- Exercises the generated-kernel path with separate rotated Q and K outputs; the existing single-output entry points use the same runtime implementation.
 
 ### Stateful Transformer decode
 
@@ -215,7 +226,7 @@ Copy `prompts/metal_kernel_generator_zh.md` or `prompts/metal_kernel_generator_e
 ./run.sh decode
 ```
 
-This workload follows the current PyTorch model's sinusoidal positional encoding, LayerNorm, cross-attention, and ReLU FFN semantics. RoPE, RMSNorm, and gated MLP remain available for a later decoder-only LLM workload.
+This workload follows the current PyTorch model's sinusoidal positional encoding, LayerNorm, cross-attention, and ReLU FFN semantics. The decoder-only workload below uses RoPE, RMSNorm, and a gated MLP.
 
 ### Decoder-only LLM and Decode GEMV
 
@@ -228,3 +239,22 @@ This workload follows the current PyTorch model's sinusoidal positional encoding
 ```bash
 ./run.sh decoder-llm
 ```
+
+### Admitted kernels in decoder execution
+
+- Adds decode-only contracts for GEMV (`decoder_gemv_64_64`, `decoder_gemv_64_128`, `decoder_gemv_128_64`), `decoder_rope`, `decoder_residual_rmsnorm`, and `decoder_gated_mlp`.
+- Decoder RoPE reads the actual position tables and int cache length. Residual RMSNorm produces both the residual sum and normalized tensor. Gated MLP replaces Gate/Up projections plus SiLU×Mul; Down projection remains a separate GEMV.
+- Benchmarks generated kernels against template sequences in one command buffer, including scalar/vector GEMV candidates. Group reductions use one threadgroup per work item.
+- The registry matches the complete current contract and device recorded by local admission, then rechecks pipeline creation, ABI, buffer sizes, dtype and dispatch at binding time. Missing or incompatible artifacts use templates. These are trusted local admission records.
+- Matching kernels bind actual decoder buffers in the reusable decode sequence. Prefill retains its template path. Standalone `silu_mul` and `rope` artifacts are not decoder replacements.
+- The runtime audit reports selected node, implementation, function, completed calls and dispatches; loaded-but-unused artifacts are reported separately. Counts cover the replacement regions.
+
+Update the Kernel Generator system prompt for the group-dispatch rules, then run:
+
+```bash
+./run.sh generate decoder-all
+./run.sh decoder-llm
+```
+
+To generate one pattern, use e.g. `./run.sh generate decoder_residual_rmsnorm`.
+Generation uses the same remote Workflow for all six patterns. Decoder execution itself makes no API calls. Look for `generated` entries with nonzero `completed_calls` and `Decoder-only validation: PASS`. If all candidates fall back, the audit reports zero generated dispatches; that does not establish successful generated-kernel integration on hardware.

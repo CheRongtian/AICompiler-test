@@ -56,7 +56,7 @@ bool validateState(const tensor::runtime::CompiledDecoderLLM &decoder,
 
 bool runDecoderLLMWorkload(tensor::metal::MetalRuntime &runtime,
                            const std::string &manifestPath,
-                           std::ostream &log) {
+                           std::ostream &log, const std::string &kernelLibrary) {
   auto imported = tensor::importer::importDecoderLLMWorkload(manifestPath);
   if (!imported.workload) {
     log << "Decoder-only import: FAIL\n"
@@ -78,7 +78,7 @@ bool runDecoderLLMWorkload(tensor::metal::MetalRuntime &runtime,
       << ", decode_steps=" << workload.decodeSteps.size()
       << ", capacity=" << plan.attention.capacity << '\n';
 
-  auto compilation = tensor::runtime::compileDecoderLLM(runtime, workload, log);
+  auto compilation = tensor::runtime::compileDecoderLLM(runtime, workload, log, kernelLibrary);
   if (!compilation.executable) {
     log << "Decoder-only compilation: FAIL\n"
         << "Compiler error: " << compilation.errorMessage << '\n';
@@ -144,6 +144,7 @@ bool runDecoderLLMWorkload(tensor::metal::MetalRuntime &runtime,
   } else {
     log << "Decoder median single-token GPU time (us): unavailable\n";
   }
+  decoder.reportKernelUsage(log);
   log << "Decoder-only validation: " << passFail(passed) << '\n';
   return passed;
 }

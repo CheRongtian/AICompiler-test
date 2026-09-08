@@ -46,6 +46,9 @@ struct ComputePipelineResult {
 [[nodiscard]] std::string
 checkBufferInterface(const ComputePipelineResult &pipeline,
                      const std::vector<ElementType> &inputs, ElementType output);
+[[nodiscard]] std::string checkBufferInterface(
+    const ComputePipelineResult &pipeline, const std::vector<ElementType> &inputs,
+    const std::vector<ElementType> &outputs, bool uintConstants = false);
 
 // Shared GPU storage, opaque to C++. read() requires completed GPU execution.
 class MetalBuffer {
@@ -59,6 +62,7 @@ public:
 
 private:
   friend class MetalRuntime;
+  friend class PreparedExecution;
   class Impl;
   explicit MetalBuffer(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
@@ -100,10 +104,13 @@ public:
   PreparedExecution(const PreparedExecution &) = delete;
   PreparedExecution &operator=(const PreparedExecution &) = delete;
 
-  // Reset output to NaNs, execute once and read output for numerical validation.
+  // Reset every output to a sentinel and execute once.
+  // ExecutionResult.output is the first output; readOutputs() reads all outputs.
   [[nodiscard]] ExecutionResult run() const;
   // Execute once without CPU readback, for graph nodes, warmup and timing samples.
   [[nodiscard]] ExecutionResult execute() const;
+  // Read every output in ABI order after completed execution.
+  [[nodiscard]] std::vector<std::vector<float>> readOutputs() const;
 
 private:
   friend class MetalRuntime;
@@ -182,6 +189,12 @@ public:
                                         std::size_t elementOffset = 0) const;
   [[nodiscard]] PreparationResult
   prepareBuffers(const std::vector<BufferHandle> &inputs, const BufferHandle &output,
+                 const DispatchSize &dispatch,
+                 const std::vector<std::uint32_t> &constants = {}) const;
+  // Inputs, then all outputs, then optional packed uint32 constants.
+  [[nodiscard]] PreparationResult
+  prepareBuffers(const std::vector<BufferHandle> &inputs,
+                 const std::vector<BufferHandle> &outputs,
                  const DispatchSize &dispatch,
                  const std::vector<std::uint32_t> &constants = {}) const;
   [[nodiscard]] SequencePreparationResult

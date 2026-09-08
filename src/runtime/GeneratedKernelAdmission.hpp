@@ -7,8 +7,9 @@
 
 namespace tensor::runtime {
 
-[[nodiscard]] bool admitGeneratedSiLUMulKernel(
-    metal::MetalRuntime &runtime, const std::string &responsePath,
-    const std::string &feedbackPath, std::ostream &log);
+[[nodiscard]] bool admitGeneratedKernel(
+    metal::MetalRuntime &runtime, const std::string &pattern, const std::string &responsePath,
+    const std::string &feedbackPath, std::ostream &log,
+    const std::string &artifactPath = {});
 
 } // namespace tensor::runtime

@@ -1,0 +1,58 @@
+{
+  "version": 2,
+  "common": [
+    "The immutable compiler contract controls semantics, buffer bindings, types, dispatch and legal workgroups.",
+    "Use valid Metal Shading Language. Never call get_thread_execution_width() or get_num_threads_per_grid(). Thread/group indices must use the parameters allowed by contract.dispatch.",
+    "Host dispatch is fixed. Read whether one work item maps to a grid thread or a whole threadgroup. All group reduction barriers must be reached uniformly by the participating threads.",
+    "Read previous_attempts and compiler_feedback from this request; remote conversation memory is unnecessary.",
+    "For performance failures preserve the working ABI and correctness, and change a concrete implementation strategy. Small dispatches may have little headroom over a fused template."
+  ],
+  "patterns": {
+    "silu_mul": [
+      "Compute sigmoid in fp32 and multiply SiLU(input0) by input1; preserve operation semantics.",
+      "Keep both input buffers active in reflection and use the uint work-item count for bounds.",
+      "Coalesced elementwise loads and stores are the starting point. Threadgroup memory or barriers usually add overhead for this independent operation."
+    ],
+    "rope": [
+      "Rotate query and key into two distinct output buffers, preserving both in the reflected ABI.",
+      "Use interleaved even/odd pairs, not a split-half rotation. Load both components before computing either rotated component.",
+      "Cosine and sine are already expanded per flattened pair in head-major order for this contract; do not infer a new position offset.",
+      "One work item owns one pair in each output. Reuse cosine and sine between query and key, with no threadgroup communication."
+    ],
+    "decoder_gemv_64_64": [
+      "Decode M=1: the weight matrix is contiguous row-major [N,K]. One threadgroup owns one output feature and reduces K input products.",
+      "Use the declared group and tid attributes. Stride the K reduction by the selected workgroup_size (this is the group width, not SIMD width). Initialize inactive lanes to zero.",
+      "Use uniform threadgroup barriers for shared reductions; only a designated thread writes the completed output.",
+      "The performance baseline includes scalar Linear and tuned vector-width 1/4 GEMV candidates. Preserve fp32 accumulation and numerical tolerance."
+    ],
+    "decoder_gemv_64_128": [
+      "Decode M=1: the weight matrix is contiguous row-major [N,K]. One threadgroup owns one output feature and reduces K input products.",
+      "Use the declared group and tid attributes. Stride the K reduction by the selected workgroup_size (this is the group width, not SIMD width). Initialize inactive lanes to zero.",
+      "Use uniform threadgroup barriers for shared reductions; only a designated thread writes the completed output.",
+      "The performance baseline includes scalar Linear and tuned vector-width 1/4 GEMV candidates. Preserve fp32 accumulation and numerical tolerance."
+    ],
+    "decoder_gemv_128_64": [
+      "Decode M=1: the weight matrix is contiguous row-major [N,K]. One threadgroup owns one output feature and reduces K input products.",
+      "Use the declared group and tid attributes. Stride the K reduction by the selected workgroup_size (this is the group width, not SIMD width). Initialize inactive lanes to zero.",
+      "Use uniform threadgroup barriers for shared reductions; only a designated thread writes the completed output.",
+      "The performance baseline includes scalar Linear and tuned vector-width 1/4 GEMV candidates. Preserve fp32 accumulation and numerical tolerance."
+    ],
+    "decoder_rope": [
+      "Use position=valid_length[0]-1 from the read-only int buffer. Cosine/sine are full [32,8] tables, not pre-expanded pairs.",
+      "Q and K inputs [1,1,64] and outputs [1,4,1,16] have identical flattened order for this decode-only batch=1 contract. Preserve interleaved pairs.",
+      "One grid thread owns one pair of both outputs. Reuse table values between Q and K. The baseline is the two existing Q/K kernels in one command buffer."
+    ],
+    "decoder_residual_rmsnorm": [
+      "Produce both the fp32 residual sum and its weighted RMSNorm output; the residual is used later by the decoder.",
+      "One threadgroup owns the width-64 row. Sum residual+update first, reduce squares, add epsilon=1e-5 after division by width.",
+      "Use group-uniform barriers. Do not read a global output written by another thread without the necessary synchronization; prefer threadgroup storage for the reduction.",
+      "The baseline is existing Add followed by RMSNorm in one command buffer."
+    ],
+    "decoder_gated_mlp": [
+      "Fuse gate and up GEMVs with SiLU(gate)*up. Down projection remains a separate decoder GEMV.",
+      "One threadgroup owns one intermediate output feature. Reuse input loads for both projections; separately reduce gate and up sums.",
+      "Apply SiLU only after the entire gate dot product has been reduced. Multiply by the completed up dot product, not partial lane products.",
+      "Compare against two tuned template GEMVs plus SiLU*Mul in one command buffer."
+    ]
+  }
+}

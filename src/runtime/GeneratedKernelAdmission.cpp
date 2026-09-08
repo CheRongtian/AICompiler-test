@@ -1,14 +1,13 @@
 #include "runtime/GeneratedKernelAdmission.hpp"
+#include "runtime/KernelRegistry.hpp"
 
-#include "analyzer/PatternAnalyzer.hpp"
-#include "backend/metal/MetalEmitter.hpp"
 #include "benchmark/Benchmark.hpp"
 #include "llm/GeneratedKernelProtocol.hpp"
+#include "llm/KernelContract.hpp"
 #include "validation/Validator.hpp"
 
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -16,37 +15,14 @@
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
-#include <string>
 #include <utility>
-#include <vector>
 
 namespace tensor::runtime {
 namespace {
-
 constexpr std::size_t kWarmup = 5;
 constexpr std::size_t kSamples = 31;
-constexpr double kMinimumSpeedup = 1.05;
-constexpr double kAbsoluteTolerance = 1e-5;
-constexpr double kRelativeTolerance = 1e-4;
-constexpr std::size_t kGuardElements = 256;
-const std::vector<std::size_t> kTemplateThreads{64, 128, 256};
-
-struct CaseData {
-  std::size_t rows = 0;
-  std::size_t width = 0;
-  std::vector<float> input;
-  std::vector<float> multiplier;
-  std::vector<double> reference;
-
-  [[nodiscard]] std::size_t elementCount() const { return rows * width; }
-};
-
-struct TemplateCandidate {
-  std::size_t threads = 0;
-  double medianUs = 0.0;
-  std::vector<std::unique_ptr<metal::PreparedExecution>> executions;
-};
-
+// A RoPE work item writes two elements; cover a full 256-thread padded tail.
+constexpr std::size_t kGuardElements = 512;
 struct Feedback {
   std::string status;
   std::string stage;
@@ -98,331 +74,245 @@ std::string writeFeedback(const Feedback &feedback, const std::string &path) {
   return {};
 }
 
-CaseData makeCase(std::size_t rows, std::size_t width, std::size_t seed) {
-  CaseData result;
-  result.rows = rows;
-  result.width = width;
-  result.input.resize(result.elementCount());
-  result.multiplier.resize(result.elementCount());
-  result.reference.resize(result.elementCount());
-  for (std::size_t index = 0; index < result.elementCount(); ++index) {
-    const int centeredInput =
-        static_cast<int>((index * 17 + seed * 29) % 257) - 128;
-    const int centeredMultiplier =
-        static_cast<int>((index * 31 + seed * 11) % 193) - 96;
-    result.input[index] = static_cast<float>(centeredInput) / 64.0f;
-    result.multiplier[index] =
-        static_cast<float>(centeredMultiplier) / 80.0f;
-    const double x = result.input[index];
-    const double activated = x / (1.0 + std::exp(-x));
-    result.reference[index] = activated * result.multiplier[index];
+
+std::vector<metal::ElementType> fp32(std::size_t count) {
+  return std::vector<metal::ElementType>(count, metal::ElementType::Float32);
+}
+
+struct CaseExecution {
+  std::unique_ptr<metal::PreparedSequence> sequence;
+  std::vector<metal::BufferHandle> outputs;
+};
+
+std::unique_ptr<CaseExecution> prepare(
+    metal::MetalRuntime &runtime, const llm::KernelContract &contract,
+    const llm::KernelCase &data, const metal::DispatchSize &dispatch,
+    const llm::KernelBaseline *baseline = nullptr) {
+  auto result = std::make_unique<CaseExecution>();
+  const bool generated = baseline == nullptr;
+  std::vector<metal::BufferHandle> buffers;
+  for (std::size_t i=0;i<data.inputs.size();++i) {
+    auto padded = data.inputs[i];
+    if (generated) padded.resize(padded.size()+kGuardElements, 1.0f);
+    auto buffer = runtime.createBuffer(padded.size(),padded.data(),contract.inputTypes[i]);
+    if (!buffer.buffer) throw std::runtime_error(buffer.errorMessage);
+    buffers.push_back(std::move(buffer.buffer));
   }
+  for (const auto &reference : data.references) {
+    auto buffer = runtime.createBuffer(reference.size()+(generated?kGuardElements:0));
+    if (!buffer.buffer) throw std::runtime_error(buffer.errorMessage);
+    buffers.push_back(buffer.buffer);
+    result->outputs.push_back(std::move(buffer.buffer));
+  }
+  std::vector<std::unique_ptr<metal::PreparedExecution>> steps;
+  if (baseline) {
+    for (auto count : baseline->intermediateCounts) {
+      auto buffer = runtime.createBuffer(count);
+      if (!buffer.buffer) throw std::runtime_error(buffer.errorMessage);
+      buffers.push_back(std::move(buffer.buffer));
+    }
+    for (const auto &step : baseline->steps) {
+      const auto pipeline = runtime.createComputePipeline(step.kernel.source,step.kernel.functionName);
+      if (!pipeline.pipelineCreationPassed) throw std::runtime_error(pipeline.errorMessage);
+      std::vector<metal::BufferHandle> inputs, outputs;
+      std::vector<metal::ElementType> inputTypes, outputTypes;
+      for (auto i : step.inputs) {
+        inputs.push_back(buffers.at(i));
+        inputTypes.push_back(buffers.at(i)->elementType());
+      }
+      for (auto i : step.outputs) {
+        outputs.push_back(buffers.at(i));
+        outputTypes.push_back(buffers.at(i)->elementType());
+      }
+      auto error = metal::checkBufferInterface(pipeline,inputTypes,outputTypes);
+      if (!error.empty()) throw std::runtime_error(error);
+      auto prepared = runtime.prepareBuffers(inputs,outputs,
+          {step.kernel.threadgroupCount,step.kernel.threadsPerThreadgroup});
+      if (!prepared.execution) throw std::runtime_error(prepared.errorMessage);
+      steps.push_back(std::move(prepared.execution));
+    }
+  } else {
+    std::vector<metal::BufferHandle> inputs(
+        buffers.begin(),buffers.begin()+data.inputs.size());
+    auto prepared = runtime.prepareBuffers(inputs,result->outputs,dispatch,data.constants);
+    if (!prepared.execution) throw std::runtime_error(prepared.errorMessage);
+    steps.push_back(std::move(prepared.execution));
+  }
+  std::vector<const metal::PreparedExecution *> pointers;
+  for (const auto &step : steps) pointers.push_back(step.get());
+  auto sequence = runtime.prepareSequence(pointers);
+  if (!sequence.execution) throw std::runtime_error(sequence.errorMessage);
+  result->sequence = std::move(sequence.execution);
   return result;
 }
 
-metal::GeneratedKernel templateKernel(const CaseData &data,
-                                      std::size_t threads) {
-  TensorGraph graph;
-  const TensorType type{{data.rows, data.width}, DType::Float32};
-  const auto input = graph.addInput("input", type);
-  const auto multiplier = graph.addInput("multiplier", type);
-  const auto activated = graph.addNode(OpType::SiLU, {input});
-  graph.outputs = {graph.addNode(OpType::Mul, {activated, multiplier})};
-  auto regions = analyzer::formRegions(analyzer::analyze(graph));
-  const auto found = std::find_if(
-      regions.regions.begin(), regions.regions.end(),
-      [](const analyzer::Region &region) {
-        return region.fusion == analyzer::FusionPattern::SiLUMul;
-      });
-  if (found == regions.regions.end()) {
-    throw std::runtime_error("SiLU + Mul template region was not formed.");
+std::string validate(metal::MetalRuntime &runtime, CaseExecution &execution,
+                     const llm::KernelCase &data,
+                     const llm::KernelContract &contract, bool guarded) {
+  for (const auto &output : execution.outputs) {
+    std::vector<float> sentinel(output->elementCount(),std::numeric_limits<float>::quiet_NaN());
+    const auto error = runtime.writeBuffer(output,sentinel.data(),sentinel.size());
+    if (!error.empty()) return error;
   }
-  return metal::emitFusion(*found, regions.analyzed, threads);
-}
-
-std::string validateOutput(const metal::ExecutionResult &execution,
-                           const CaseData &data) {
-  if (!execution.executionPassed) return execution.errorMessage;
-  const auto comparison = validation::compare(
-      execution.output, data.reference, kAbsoluteTolerance, kRelativeTolerance);
-  return comparison.passed ? std::string{} : comparison.errorMessage;
-}
-
-std::string validateGeneratedOutput(const metal::ExecutionResult &execution,
-                                    const CaseData &data) {
-  if (!execution.executionPassed) return execution.errorMessage;
-  if (execution.output.size() != data.elementCount() + kGuardElements) {
-    return "Generated output buffer has an unexpected length.";
-  }
-  std::vector<float> logical(execution.output.begin(),
-                             execution.output.begin() + data.elementCount());
-  const auto comparison = validation::compare(
-      logical, data.reference, kAbsoluteTolerance, kRelativeTolerance);
-  if (!comparison.passed) return comparison.errorMessage;
-  const auto guard = execution.output.begin() + data.elementCount();
-  if (!std::all_of(guard, execution.output.end(),
-                   [](float value) { return std::isnan(value); })) {
-    return "Output guard was modified by a thread outside element_count.";
+  const auto result = execution.sequence->execute();
+  if (!result.executionPassed) return result.errorMessage;
+  for (std::size_t i=0;i<execution.outputs.size();++i) {
+    const auto output = execution.outputs[i]->read();
+    const auto count = data.references[i].size();
+    if (output.size() != count+(guarded?kGuardElements:0)) return "Output size mismatch.";
+    const std::vector<float> logical(output.begin(),output.begin()+count);
+    const auto comparison = validation::compare(
+        logical,data.references[i],contract.absoluteTolerance,contract.relativeTolerance);
+    if (!comparison.passed) return contract.outputNames[i]+": "+comparison.errorMessage;
+    if (guarded && !std::all_of(output.begin()+count,output.end(),
+                               [](float value){return std::isnan(value);}))
+      return "Output guard modified: "+contract.outputNames[i];
   }
   return {};
 }
 
-std::string generatedInterfaceError(
-    const metal::ComputePipelineResult &pipeline) {
-  if (!pipeline.reflectionAvailable || pipeline.bindings.size() != 4) {
-    return "Reflection must contain two fp32 inputs, one fp32 output, and one uint constant.";
-  }
-  const metal::PipelineBinding *bindings[4]{};
-  for (const auto &binding : pipeline.bindings) {
-    if (!binding.isBuffer || binding.index >= 4 || bindings[binding.index]) {
-      return "Generated kernel must use unique buffer bindings 0 through 3.";
-    }
-    bindings[binding.index] = &binding;
-  }
-  if (!bindings[0] || !bindings[1] || !bindings[2] || !bindings[3]) {
-    return "Generated kernel is missing a required buffer binding.";
-  }
-  if (!bindings[0]->isFloat32 || !bindings[0]->readOnly ||
-      !bindings[1]->isFloat32 || !bindings[1]->readOnly) {
-    return "Bindings 0 and 1 must be read-only fp32 buffers.";
-  }
-  if (!bindings[2]->isFloat32 || !bindings[2]->writable) {
-    return "Binding 2 must be a writable fp32 buffer.";
-  }
-  if (!bindings[3]->isUInt32 || !bindings[3]->readOnly) {
-    return "Binding 3 must be a read-only uint element count.";
-  }
-  return {};
-}
+struct Baseline {
+  std::unique_ptr<CaseExecution> execution;
+  double medianUs = std::numeric_limits<double>::infinity();
+  std::string name;
+};
 
-std::unique_ptr<metal::PreparedExecution>
-prepareTemplate(metal::MetalRuntime &runtime, const CaseData &data,
-                std::size_t threads, std::string &error) {
-  const auto kernel = templateKernel(data, threads);
-  const auto pipeline = runtime.createComputePipeline(kernel.source,
-                                                      kernel.functionName);
-  if (!pipeline.pipelineCreationPassed) {
-    error = pipeline.errorMessage;
-    return {};
+Baseline baselineFor(metal::MetalRuntime &runtime,
+                     const llm::KernelContract &contract,
+                     const llm::KernelCase &data, std::ostream &log) {
+  Baseline best;
+  for (const auto &plan : llm::makeContractBaselines(contract,data)) {
+    try {
+      auto execution = prepare(runtime,contract,data,{},&plan);
+      auto error = validate(runtime,*execution,data,contract,false);
+      if (!error.empty()) throw std::runtime_error(error);
+      error = benchmark::warmup(*execution->sequence,kWarmup);
+      if (!error.empty()) throw std::runtime_error(error);
+      const auto timing = benchmark::measure(*execution->sequence,kSamples);
+      if (!timing.passed) throw std::runtime_error(timing.errorMessage);
+      log << "Template baseline " << plan.name
+          << " validation: PASS, median(us)=" << timing.stats.medianUs << '\n';
+      if (timing.stats.medianUs<best.medianUs)
+        best={std::move(execution),timing.stats.medianUs,plan.name};
+    } catch (const std::exception &error) {
+      log << "Template baseline " << plan.name << ": FAIL: " << error.what() << '\n';
+    }
   }
-  error = metal::checkFloatBufferInterface(pipeline, 2);
-  if (!error.empty()) return {};
-  auto prepared = runtime.prepare(
-      {{data.input.data(), data.input.size()},
-       {data.multiplier.data(), data.multiplier.size()}},
-      data.elementCount(),
-      {kernel.threadgroupCount, kernel.threadsPerThreadgroup});
-  error = prepared.errorMessage;
-  return std::move(prepared.execution);
+  if (!best.execution) throw std::runtime_error("No valid template baseline available.");
+  log << "Selected baseline " << best.name << ", median(us)=" << best.medianUs << '\n';
+  return best;
 }
-
-std::vector<TemplateCandidate>
-prepareTemplateCandidates(metal::MetalRuntime &runtime,
-                          const std::vector<CaseData> &cases,
-                          std::ostream &log) {
-  std::vector<TemplateCandidate> results;
-  for (const auto threads : kTemplateThreads) {
-    if (threads > runtime.hardwareInfo().maxThreadsPerThreadgroup) continue;
-    TemplateCandidate candidate;
-    candidate.threads = threads;
-    bool valid = true;
-    for (const auto &data : cases) {
-      std::string error;
-      auto execution = prepareTemplate(runtime, data, threads, error);
-      if (!execution) {
-        log << "Template baseline threads=" << threads
-            << " preparation: FAIL: " << error << '\n';
-        valid = false;
-        break;
-      }
-      error = validateOutput(execution->run(), data);
-      if (!error.empty()) {
-        log << "Template baseline threads=" << threads
-            << " validation: FAIL: " << error << '\n';
-        valid = false;
-        break;
-      }
-      candidate.executions.push_back(std::move(execution));
-    }
-    if (!valid) continue;
-    const auto warmup = benchmark::warmup(*candidate.executions.back(), kWarmup);
-    if (!warmup.empty()) {
-      log << "Template baseline threads=" << threads
-          << " warmup: FAIL: " << warmup << '\n';
-      continue;
-    }
-    const auto timing = benchmark::measure(*candidate.executions.back(), kSamples);
-    if (!timing.passed) {
-      log << "Template baseline threads=" << threads
-          << " benchmark: FAIL: " << timing.errorMessage << '\n';
-      continue;
-    }
-    candidate.medianUs = timing.stats.medianUs;
-    log << "Template baseline threads=" << threads
-        << " validation: PASS, median(us)=" << candidate.medianUs << '\n';
-    results.push_back(std::move(candidate));
-  }
-  return results;
-}
-
 } // namespace
 
-bool admitGeneratedSiLUMulKernel(metal::MetalRuntime &runtime,
-                                 const std::string &responsePath,
-                                 const std::string &feedbackPath,
-                                 std::ostream &log) {
-  const std::vector<CaseData> cases{
-      makeCase(1, 4096, 1), makeCase(3, 4097, 2)};
-  auto baselines = prepareTemplateCandidates(runtime, cases, log);
-  if (baselines.empty()) {
-    const Feedback feedback{"fatal", "baseline",
-                            "No valid template baseline is available."};
+bool admitGeneratedKernel(metal::MetalRuntime &runtime,
+                           const std::string &pattern,
+                           const std::string &responsePath,
+                           const std::string &feedbackPath, std::ostream &log,
+                           const std::string &artifactPath) {
+  auto report = [&](const Feedback &feedback) {
     const auto error = writeFeedback(feedback, feedbackPath);
-    if (!error.empty()) log << "Feedback error: " << error << '\n';
-    log << "Generated kernel admission: FAIL\n";
-    return false;
-  }
-  auto baseline = std::min_element(
-      baselines.begin(), baselines.end(),
-      [](const auto &left, const auto &right) {
-        return left.medianUs < right.medianUs;
-      });
-  log << "Selected performance baseline: template fused SiLU + Mul, threads="
-      << baseline->threads << ", median(us)=" << baseline->medianUs << '\n';
-
-  const auto fallback = [&](const std::string &stage,
-                            const std::string &message,
-                            std::optional<double> pairedBaselineUs = std::nullopt,
-                            std::optional<double> candidateUs = std::nullopt,
-                            std::optional<double> speedup = std::nullopt) {
-    log << "Generated candidate " << stage << ": FAIL: " << message << '\n'
-        << "Generated kernel admission: FALLBACK\n"
-        << "Selected: template fused SiLU + Mul\n";
-    Feedback feedback{"retry", stage, message};
-    if (pairedBaselineUs && candidateUs && speedup) {
-      feedback.baselineUs = pairedBaselineUs;
-      feedback.candidateUs = candidateUs;
-      feedback.speedup = speedup;
-    }
-    const auto error = writeFeedback(feedback, feedbackPath);
+    log << "Generated candidate " << feedback.stage << ": "
+        << (feedback.status == "admitted" ? "PASS" : "FAIL")
+        << ": " << feedback.message << '\n';
     if (!error.empty()) {
       log << "Feedback error: " << error << '\n';
       return false;
     }
-    return true;
+    log << "Generated kernel admission: "
+        << (feedback.status == "admitted" ? "PASS" :
+            feedback.status == "fatal" ? "FAIL" : "FALLBACK") << '\n'
+        << "Selected: " << (feedback.status == "admitted" ? "generated " : "template ")
+        << pattern << '\n';
+    return feedback.status != "fatal";
   };
-
-  auto loaded = llm::loadGeneratedKernelResponse(responsePath);
-  if (!loaded.response) return fallback("response_parse", loaded.errorMessage);
-  const auto &generated = *loaded.response;
-  if (generated.functionName != "generated_silu_mul") {
-    return fallback("contract",
-                    "function_name must be generated_silu_mul.");
-  }
-  if (std::find(kTemplateThreads.begin(), kTemplateThreads.end(),
-                generated.workgroupSize) == kTemplateThreads.end() ||
-      generated.workgroupSize > runtime.hardwareInfo().maxThreadsPerThreadgroup) {
-    return fallback("hardware_filter",
-                    "workgroup_size must be a legal value: 64, 128, or 256.");
-  }
-
-  const auto pipeline = runtime.createComputePipeline(
-      generated.source, generated.functionName);
-  if (!pipeline.pipelineCreationPassed) {
-    return fallback("compile", pipeline.errorMessage);
-  }
-  log << "Generated candidate compile: PASS\n";
-  const auto interfaceError = generatedInterfaceError(pipeline);
-  if (!interfaceError.empty()) return fallback("interface", interfaceError);
-  if (generated.workgroupSize > pipeline.maxTotalThreadsPerThreadgroup) {
-    return fallback("interface",
-                    "workgroup_size exceeds the compiled pipeline limit.");
-  }
-  log << "Generated candidate interface: PASS\n";
-
-  std::vector<std::unique_ptr<metal::PreparedExecution>> candidates;
-  for (std::size_t index = 0; index < cases.size(); ++index) {
-    const auto &data = cases[index];
-    const auto count = data.elementCount();
-    if (count > std::numeric_limits<std::uint32_t>::max()) {
-      return fallback("prepare", "element_count exceeds uint32.");
+  try {
+    const auto contract = llm::makeKernelContract(pattern);
+    std::vector<Baseline> baselines;
+    for (std::size_t i = 0; i < contract.cases.size(); ++i) {
+      log << "Template baseline case " << i << '\n';
+      baselines.push_back(baselineFor(runtime, contract, contract.cases[i], log));
     }
-    auto guardedInput = data.input;
-    auto guardedMultiplier = data.multiplier;
-    guardedInput.resize(count + kGuardElements, 0.75f);
-    guardedMultiplier.resize(count + kGuardElements, 1.25f);
-    auto prepared = runtime.prepare(
-        {{guardedInput.data(), guardedInput.size()},
-         {guardedMultiplier.data(), guardedMultiplier.size()}},
-        count + kGuardElements,
-        {(count + generated.workgroupSize - 1) / generated.workgroupSize,
-         generated.workgroupSize},
-        {static_cast<std::uint32_t>(count)});
-    if (!prepared.execution) return fallback("prepare", prepared.errorMessage);
-    const auto validationError =
-        validateGeneratedOutput(prepared.execution->run(), data);
-    if (!validationError.empty()) {
-      return fallback("numerical_validation",
-                      "case " + std::to_string(index) + ": " + validationError);
+    auto loaded = llm::loadGeneratedKernelResponse(responsePath);
+    if (!loaded.response)
+      return report({"retry", "response_parse", loaded.errorMessage});
+    const auto &candidate = *loaded.response;
+    if (candidate.functionName != contract.functionName)
+      return report({"retry", "contract", "Expected function_name: " + contract.functionName});
+    if (std::find(contract.workgroupSizes.begin(), contract.workgroupSizes.end(),
+                  candidate.workgroupSize) == contract.workgroupSizes.end() ||
+        candidate.workgroupSize > runtime.hardwareInfo().maxThreadsPerThreadgroup)
+      return report({"retry", "hardware_filter", "workgroup_size is not legal for this contract/device."});
+    const auto pipeline = runtime.createComputePipeline(candidate.source, candidate.functionName);
+    if (!pipeline.pipelineCreationPassed)
+      return report({"retry", "compile", pipeline.errorMessage});
+    log << "Generated candidate compile: PASS\n";
+    const auto interfaceError = metal::checkBufferInterface(
+        pipeline, contract.inputTypes, fp32(contract.outputNames.size()), true);
+    if (!interfaceError.empty())
+      return report({"retry", "interface", interfaceError});
+    if (candidate.workgroupSize > pipeline.maxTotalThreadsPerThreadgroup ||
+        pipeline.staticThreadgroupMemoryLength > runtime.hardwareInfo().maxThreadgroupMemoryLength)
+      return report({"retry", "hardware_filter", "Compiled pipeline exceeds device/dispatch limits."});
+    log << "Generated candidate interface: PASS, outputs="
+        << contract.outputNames.size() << '\n';
+
+    std::vector<std::unique_ptr<CaseExecution>> executions;
+    for (std::size_t i = 0; i < contract.cases.size(); ++i) {
+      const auto &data = contract.cases[i];
+      std::unique_ptr<CaseExecution> execution;
+      try {
+        execution = prepare(runtime, contract, data,
+            llm::contractDispatch(contract,data.workItems,candidate.workgroupSize));
+      } catch (const std::exception &error) {
+        return report({"retry", "prepare", error.what()});
+      }
+      const auto error = validate(runtime,*execution, data, contract, true);
+      if (!error.empty())
+        return report({"retry", "numerical_validation", "case " + std::to_string(i) + ": " + error});
+      log << "Generated candidate case " << i << " all outputs numerical validation: PASS\n";
+      executions.push_back(std::move(execution));
     }
-    log << "Generated candidate case " << index
-        << " shape=[" << data.rows << ',' << data.width
-        << "] numerical validation: PASS\n";
-    candidates.push_back(std::move(prepared.execution));
-  }
 
-  const auto warmup = benchmark::warmup(*candidates.back(), kWarmup);
-  if (!warmup.empty()) return fallback("warmup", warmup);
-  log << "Generated candidate warmup: PASS\n";
-  const auto first = benchmark::measurePair(
-      *baseline->executions.back(), *candidates.back(), kSamples);
-  if (!first.passed) return fallback("benchmark", first.errorMessage);
-  log << "Generated candidate benchmark: PASS, baseline(us)="
-      << first.baseline.medianUs << ", candidate(us)="
-      << first.candidate.medianUs << ", speedup=" << first.speedup << "x\n";
-  if (first.speedup < kMinimumSpeedup) {
-    return fallback("performance", "Speedup is below 1.05x.",
-                    first.baseline.medianUs, first.candidate.medianUs,
-                    first.speedup);
+    double worstSpeedup = std::numeric_limits<double>::infinity();
+    std::optional<Feedback> performanceFailure;
+    Feedback accepted{"admitted", "admission", "All cases passed correctness and two performance rounds."};
+    for (std::size_t i = 0; i < executions.size(); ++i) {
+      const auto error = benchmark::warmup(*executions[i]->sequence, kWarmup);
+      if (!error.empty()) return report({"retry", "warmup", error});
+      for (std::size_t round = 0; round < 2; ++round) {
+        const auto timing = benchmark::measurePair(
+            *baselines[i].execution->sequence, *executions[i]->sequence, kSamples);
+        if (!timing.passed) return report({"retry", "benchmark", timing.errorMessage});
+        log << "Generated candidate case " << i << " round " << round + 1
+            << ": baseline(us)=" << timing.baseline.medianUs
+            << ", candidate(us)=" << timing.candidate.medianUs
+            << ", speedup=" << timing.speedup << "x\n";
+        if (timing.speedup < worstSpeedup) {
+          worstSpeedup = timing.speedup;
+          accepted.baselineUs = timing.baseline.medianUs;
+          accepted.candidateUs = timing.candidate.medianUs;
+          accepted.speedup = timing.speedup;
+        }
+        if (timing.speedup < contract.minimumSpeedup &&
+            (!performanceFailure || timing.speedup < *performanceFailure->speedup))
+          performanceFailure = Feedback{
+              "retry", "performance", "case " + std::to_string(i) +
+              " round " + std::to_string(round + 1) + " speedup is below " +
+              std::to_string(contract.minimumSpeedup) + "x.",
+              timing.baseline.medianUs, timing.candidate.medianUs, timing.speedup};
+      }
+      const auto finalError = validate(runtime,*executions[i], contract.cases[i], contract, true);
+      if (!finalError.empty())
+        return report({"retry", "final_validation", finalError});
+    }
+    if (performanceFailure) return report(*performanceFailure);
+    if (!artifactPath.empty()) {
+      const auto error = writeAdmittedKernel(runtime,contract,candidate,artifactPath);
+      if (!error.empty()) return report({"fatal","artifact_write",error});
+    }
+    return report(accepted);
+  } catch (const std::exception &error) {
+    return report({"fatal", "baseline_or_contract", error.what()});
   }
-
-  const auto confirmation = benchmark::measurePair(
-      *baseline->executions.back(), *candidates.back(), kSamples);
-  if (!confirmation.passed) {
-    return fallback("confirmation_benchmark", confirmation.errorMessage);
-  }
-  const double conservativeSpeedup =
-      std::min(first.speedup, confirmation.speedup);
-  log << "Generated candidate confirmation: baseline(us)="
-      << confirmation.baseline.medianUs << ", candidate(us)="
-      << confirmation.candidate.medianUs << ", speedup="
-      << confirmation.speedup << "x\n";
-  if (conservativeSpeedup < kMinimumSpeedup) {
-    return fallback("performance",
-                    "Confirmation speedup is below 1.05x.",
-                    confirmation.baseline.medianUs,
-                    confirmation.candidate.medianUs, conservativeSpeedup);
-  }
-
-  const auto finalError =
-      validateGeneratedOutput(candidates.back()->run(), cases.back());
-  if (!finalError.empty()) {
-    return fallback("final_validation", finalError);
-  }
-  Feedback feedback{"admitted", "admission",
-                    "Compile, interface, correctness, and performance passed.",
-                    confirmation.baseline.medianUs,
-                    confirmation.candidate.medianUs, conservativeSpeedup};
-  const auto feedbackError = writeFeedback(feedback, feedbackPath);
-  if (!feedbackError.empty()) {
-    log << "Feedback error: " << feedbackError << '\n';
-    return false;
-  }
-  log << "Generated kernel admission: PASS\n"
-      << "Selected: LLM-generated SiLU + Mul, threads="
-      << generated.workgroupSize << ", conservative speedup="
-      << conservativeSpeedup << "x\n";
-  return true;
 }
-
 } // namespace tensor::runtime

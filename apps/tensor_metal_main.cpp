@@ -132,8 +132,28 @@ int main(int argc, char **argv) {
     if (argc == 3 && std::string(argv[1]) == "--decoder-llm") {
       return runDecoderLLMWorkload(runtime, argv[2], std::cout) ? 0 : 1;
     }
+    if (argc == 5 && std::string(argv[1]) == "--decoder-llm" &&
+        std::string(argv[3]) == "--kernel-library") {
+      return runDecoderLLMWorkload(runtime, argv[2], std::cout, argv[4]) ? 0 : 1;
+    }
     if (argc == 3 && std::string(argv[1]) == "--emit-kernel-contract") {
       return emitGeneratedKernelContract(runtime, argv[2], std::cout) ? 0 : 1;
+    }
+    if (argc == 5 && std::string(argv[1]) == "--emit-kernel-contract" &&
+        std::string(argv[3]) == "--pattern") {
+      return emitGeneratedKernelContract(runtime, argv[2], std::cout, argv[4]) ? 0 : 1;
+    }
+    if (argc == 7 && std::string(argv[1]) == "--admit-generated-kernel" &&
+        std::string(argv[3]) == "--feedback-output" &&
+        std::string(argv[5]) == "--pattern") {
+      return runGeneratedKernelAdmission(runtime, argv[2], argv[4], std::cout, argv[6]) ? 0 : 1;
+    }
+    if (argc == 9 && std::string(argv[1]) == "--admit-generated-kernel" &&
+        std::string(argv[3]) == "--feedback-output" &&
+        std::string(argv[5]) == "--pattern" &&
+        std::string(argv[7]) == "--artifact-output") {
+      return runGeneratedKernelAdmission(runtime, argv[2], argv[4], std::cout,
+                                          argv[6], argv[8]) ? 0 : 1;
     }
     if (argc == 5 && std::string(argv[1]) == "--admit-generated-kernel" &&
         std::string(argv[3]) == "--feedback-output") {
@@ -148,9 +168,10 @@ int main(int argc, char **argv) {
                    " [--import-pytorch <graph-manifest> --advisor-response <json>]"
                    " [--kv-cache <cache-manifest>]"
                    " [--transformer-decode <decoder-manifest>]"
-                   " [--decoder-llm <decoder-manifest>]"
-                   " [--emit-kernel-contract <json>]"
-                   " [--admit-generated-kernel <json> --feedback-output <json>]\n";
+                   " [--decoder-llm <decoder-manifest> [--kernel-library <directory>]]"
+                   " [--emit-kernel-contract <json> [--pattern <pattern>]]"
+                   " [--admit-generated-kernel <json> --feedback-output <json>"
+                   " --pattern <pattern> [--artifact-output <json>]]\n";
       return 1;
     }
 

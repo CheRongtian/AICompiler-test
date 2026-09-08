@@ -99,6 +99,7 @@ add_executable(TensorMetalCompiler
   src/llm/AdvisorProtocol.cpp
   src/llm/KernelContract.hpp
   src/llm/KernelContract.cpp
+  src/llm/DecoderKernelContracts.cpp
   src/llm/GeneratedKernelProtocol.hpp
   src/llm/GeneratedKernelProtocol.mm
   src/backend/metal/MetalEmitter.hpp
@@ -128,6 +129,8 @@ add_executable(TensorMetalCompiler
   src/runtime/StatefulExecutor.cpp
   src/runtime/GeneratedKernelAdmission.hpp
   src/runtime/GeneratedKernelAdmission.cpp
+  src/runtime/KernelRegistry.hpp
+  src/runtime/KernelRegistry.mm
   src/runtime/TransformerDecodeExecutor.hpp
   src/runtime/TransformerDecodeExecutor.cpp
   src/runtime/DecoderLLMExecutor.hpp

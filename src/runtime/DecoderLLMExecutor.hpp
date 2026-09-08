@@ -36,12 +36,14 @@ public:
   [[nodiscard]] std::vector<float> readKeyPrefix(std::size_t layer) const;
   [[nodiscard]] std::vector<float> readValuePrefix(std::size_t layer) const;
   [[nodiscard]] bool cacheStorageReused() const noexcept;
+  void reportKernelUsage(std::ostream &log) const;
 
 private:
   class Impl;
   explicit CompiledDecoderLLM(std::unique_ptr<Impl> impl);
   friend DecoderLLMCompilation compileDecoderLLM(
-      metal::MetalRuntime &, const DecoderLLMWorkload &, std::ostream &);
+      metal::MetalRuntime &, const DecoderLLMWorkload &, std::ostream &,
+      const std::string &);
   std::unique_ptr<Impl> impl_;
 };
 
@@ -52,6 +54,6 @@ struct DecoderLLMCompilation {
 
 [[nodiscard]] DecoderLLMCompilation compileDecoderLLM(
     metal::MetalRuntime &runtime, const DecoderLLMWorkload &workload,
-    std::ostream &log);
+    std::ostream &log, const std::string &kernelLibrary = {});
 
 } // namespace tensor::runtime

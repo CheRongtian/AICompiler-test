@@ -51,6 +51,16 @@ loadGeneratedKernelResponse(const std::string &path) {
           "Unable to read the generated-kernel response.");
       return result;
     }
+    NSString *json = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (json == nil) return {std::nullopt, "Generated response is not UTF-8."};
+    return parseGeneratedKernelResponse(toString(json));
+  }
+}
+
+GeneratedKernelResponseResult parseGeneratedKernelResponse(const std::string &json) {
+  GeneratedKernelResponseResult result;
+  @autoreleasepool {
+    NSData *data = [NSData dataWithBytes:json.data() length:json.size()];
     NSError *jsonError = nil;
     id decoded = [NSJSONSerialization JSONObjectWithData:data
                                                  options:0

@@ -7,4 +7,4 @@
 
 [[nodiscard]] bool runDecoderLLMWorkload(
     tensor::metal::MetalRuntime &runtime, const std::string &manifestPath,
-    std::ostream &log);
+    std::ostream &log, const std::string &kernelLibrary = {});

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Generate, validate, and retry one Metal SiLU + Mul kernel."""
+"""Request pattern-specific Metal kernels; keep retry and admission local."""
 
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import urllib.error
@@ -20,6 +19,11 @@ class GeneratorError(RuntimeError):
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REQUEST_TIMEOUT_SECONDS = 60.0
 MAX_ATTEMPTS = 3
+PATTERNS = (
+    "silu_mul", "rope",
+    "decoder_gemv_64_64", "decoder_gemv_64_128", "decoder_gemv_128_64",
+    "decoder_rope", "decoder_residual_rmsnorm", "decoder_gated_mlp",
+)
 
 
 def _load_env(path):
@@ -143,6 +147,7 @@ def main():
     parser.add_argument(
         "--env-file", type=Path, default=PROJECT_ROOT / ".env"
     )
+    parser.add_argument("--pattern", choices=PATTERNS, default="silu_mul")
     args = parser.parse_args()
 
     _load_env(args.env_file)
@@ -156,27 +161,51 @@ def main():
     if not compiler.is_file():
         raise GeneratorError(f"Compiler executable does not exist: {compiler}")
 
+    library = _read_json(PROJECT_ROOT / "config" / "kernel_principles.json", "principle library")
+    if not isinstance(library, dict) or library.get("version") != 2:
+        raise GeneratorError("Unsupported principle library version.")
+    common = library.get("common")
+    patterns = library.get("patterns")
+    specific = patterns.get(args.pattern) if isinstance(patterns, dict) else None
+    if not isinstance(common, list) or not isinstance(specific, list):
+        raise GeneratorError("Missing common or pattern-specific principles.")
+    if not all(isinstance(value, str) for value in common + specific):
+        raise GeneratorError("Principles must be strings.")
+    principles = {"version": library["version"], "common": common, "pattern": specific}
+
     work_dir = args.work_dir.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     contract_path = work_dir / "contract.json"
     candidate_path = work_dir / "candidate.json"
     feedback_path = work_dir / "feedback.json"
-    admitted_path = work_dir / "admitted_silu_mul.json"
-    admitted_path.unlink(missing_ok=True)
+    admitted_path = work_dir / "admitted.json"
 
     _run_compiler(
-        [str(compiler), "--emit-kernel-contract", str(contract_path)]
+        [str(compiler), "--emit-kernel-contract", str(contract_path), "--pattern", args.pattern]
     )
     try:
         contract_text = contract_path.read_text(encoding="utf-8").strip()
-        json.loads(contract_text)
+        contract = json.loads(contract_text)
     except (OSError, json.JSONDecodeError) as error:
         raise GeneratorError(f"Unable to read kernel contract: {error}") from error
 
     session_id = str(uuid.uuid4())
-    messages = [{"role": "user", "content": contract_text}]
+    previous_attempts = []
+    feedback = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"Generated kernel attempt: {attempt}/{MAX_ATTEMPTS}")
+        request = {
+            "task": "Return the next GeneratedKernel JSON matching contract.response_schema.",
+            "pattern": args.pattern,
+            "contract": contract,
+            "principles": principles,
+            "attempt": attempt,
+            "previous_attempts": previous_attempts,
+            "compiler_feedback": feedback,
+        }
+        request_text = json.dumps(request, ensure_ascii=False, separators=(",", ":"))
+        _write_text(work_dir / f"request_{attempt}.json", request_text)
+        messages = [{"role": "user", "content": request_text}]
         try:
             assistant_content = _call_endpoint(
                 endpoint, api_key, session_id, messages
@@ -184,7 +213,7 @@ def main():
         except GeneratorError as error:
             print(f"LLM request unavailable: {error}")
             print("LLM generated kernel: FALLBACK")
-            print("The existing template kernel remains selected.")
+            print("No new candidate was produced; existing admitted artifacts are unchanged.")
             return
         _write_text(candidate_path, assistant_content)
 
@@ -195,12 +224,17 @@ def main():
                 str(candidate_path),
                 "--feedback-output",
                 str(feedback_path),
+                "--pattern",
+                args.pattern,
+                "--artifact-output",
+                str(admitted_path),
             ]
         )
         feedback = _read_json(feedback_path, "compiler feedback")
         status = feedback.get("status")
         if status == "admitted":
-            shutil.copyfile(candidate_path, admitted_path)
+            if not admitted_path.is_file():
+                raise GeneratorError("Compiler reported admission without an artifact.")
             print("LLM generated kernel: ADMITTED")
             print(f"Admitted kernel: {admitted_path}")
             return
@@ -209,31 +243,18 @@ def main():
         if status != "retry":
             raise GeneratorError("Compiler feedback has an unknown status.")
 
-        messages.append({"role": "assistant", "content": assistant_content})
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "The compiler rejected the previous kernel. Generate a corrected "
-                    "response using the original contract and compiler feedback below.\n\n"
-                    "The original contract remains authoritative and immutable. Preserve "
-                    "the exact function name, complete parameter list, parameter order, "
-                    "types, address spaces, access qualifiers, buffer indices, grid-index "
-                    "attribute, mathematical semantics, and element_count bounds check. "
-                    "Do not remove an input, replace constant uint& with a struct, or infer "
-                    "element_count from the dispatch size. A retry may change only the "
-                    "kernel-body implementation and select a workgroup size from "
-                    "legal_workgroup_sizes. Return raw JSON matching response_schema.\n\n"
-                    "ORIGINAL CONTRACT:\n"
-                    + contract_text
-                    + "\n\nCOMPILER FEEDBACK:\n"
-                    + json.dumps(feedback, separators=(",", ":"))
-                ),
-            }
-        )
+        previous_attempts.append({
+            "attempt": attempt,
+            "response": assistant_content,
+            "compiler_feedback": feedback,
+        })
 
     print("LLM generated kernel: FALLBACK")
-    print("Retry budget exhausted; the validated template kernel remains selected.")
+    print("Retry budget exhausted; no new kernel was admitted.")
+    if admitted_path.exists():
+        print("The existing admitted artifact is retained for decoder contract/device checks.")
+    else:
+        print("No admitted artifact exists; the decoder will use its template.")
 
 
 if __name__ == "__main__":

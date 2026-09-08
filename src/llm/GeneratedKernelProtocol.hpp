@@ -20,5 +20,7 @@ struct GeneratedKernelResponseResult {
 
 [[nodiscard]] GeneratedKernelResponseResult
 loadGeneratedKernelResponse(const std::string &path);
+[[nodiscard]] GeneratedKernelResponseResult
+parseGeneratedKernelResponse(const std::string &json);
 
 } // namespace tensor::llm
