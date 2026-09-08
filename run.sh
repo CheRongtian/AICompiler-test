@@ -10,19 +10,20 @@ BUILD_DIR="$ROOT/build"
 MANIFEST="$BUILD_DIR/transformer.tmc"
 DECODE_MANIFEST="$BUILD_DIR/transformer_decode.tmc"
 DECODER_LLM_MANIFEST="$BUILD_DIR/decoder_llm.tmc"
+KV_MANIFEST="$BUILD_DIR/kv_cache.tmc"
 REQUEST="$BUILD_DIR/advisor_request.json"
 RESPONSE="$BUILD_DIR/advisor_response.json"
 COMPILER="$BUILD_DIR/TensorMetalCompiler"
 
-if [[ "$MODE" != "advisor" && "$MODE" != "generate" && "$MODE" != "decode" && "$MODE" != "decoder-llm" ]]; then
-  echo "Usage: ./run.sh [advisor|generate [pattern|decoder-all]|decode|decoder-llm]" >&2
+if [[ "$MODE" != "advisor" && "$MODE" != "generate" && "$MODE" != "decode" && "$MODE" != "decoder-llm" && "$MODE" != "benchmark" && "$MODE" != "ablation" && "$MODE" != "regression" ]]; then
+  echo "Usage: ./run.sh [advisor|generate [pattern|decoder-all]|decode|decoder-llm|benchmark|ablation|regression]" >&2
   exit 1
 fi
 
 advisor_url=""
 kernel_generator_url=""
 api_key=""
-if [[ "$MODE" == "advisor" || "$MODE" == "generate" ]]; then
+if [[ "$MODE" == "advisor" || "$MODE" == "generate" || "$MODE" == "ablation" ]]; then
   if [[ ! -f "$ENV_FILE" ]]; then
     echo "Missing $ENV_FILE. Create it from .env.example and fill in URL and API key." >&2
     exit 1
@@ -38,7 +39,7 @@ if [[ "$MODE" == "advisor" || "$MODE" == "generate" ]]; then
     echo "TMC_LLM_API_KEY is empty in .env." >&2
     exit 1
   fi
-  if [[ "$MODE" == "advisor" && -z "$advisor_url" ]]; then
+  if [[ "$MODE" != "generate" && -z "$advisor_url" ]]; then
     echo "TMC_LLM_ADVISOR_URL is empty in .env." >&2
     exit 1
   fi
@@ -96,5 +97,78 @@ case "$MODE" in
 
     "$COMPILER" --decoder-llm "$DECODER_LLM_MANIFEST" \
       --kernel-library "$BUILD_DIR/generated_kernels"
+    ;;
+  benchmark)
+    "$PYTHON" "$ROOT/tools/export_decoder_llm.py" \
+      --output "$DECODER_LLM_MANIFEST"
+
+    "$PYTHON" "$ROOT/tools/benchmark_decoder_mps.py" \
+      --warmup 2 --samples 10
+
+    "$COMPILER" --benchmark-decoder-llm "$DECODER_LLM_MANIFEST" \
+      --kernel-library "$BUILD_DIR/generated_kernels" \
+      --warmup 2 --samples 10
+    ;;
+  ablation)
+    "$PYTHON" "$ROOT/tools/export_pytorch.py" \
+      --output "$MANIFEST"
+
+    echo "Advisor ablation: OFF"
+    "$COMPILER" --benchmark-import-pytorch "$MANIFEST"
+
+    "$COMPILER" --import-pytorch "$MANIFEST" \
+      --emit-advisor-request "$REQUEST"
+
+    "$PYTHON" "$ROOT/tools/llm_advisor.py" \
+      --input "$REQUEST" \
+      --output "$RESPONSE"
+
+    echo "Advisor ablation: ON"
+    "$COMPILER" --benchmark-import-pytorch "$MANIFEST" \
+      --advisor-response "$RESPONSE"
+    ;;
+  regression)
+    echo "Regression: Metal baseline, autotuning, TensorIR, and fusion"
+    "$COMPILER"
+
+    echo "Regression: PyTorch importer"
+    regression_models=(
+      "$ROOT/workloads/pytorch/test_model.py"
+      "$ROOT/tests/models/test_linear.py"
+      "$ROOT/tests/models/test_mlp.py"
+    )
+    for regression_model_path in "${regression_models[@]}"; do
+      regression_model="$(basename "$regression_model_path" .py)"
+      "$PYTHON" "$ROOT/tools/export_pytorch.py" \
+        --model "$regression_model_path" \
+        --output "$BUILD_DIR/${regression_model}.tmc"
+      "$COMPILER" --import-pytorch "$BUILD_DIR/${regression_model}.tmc"
+    done
+
+    echo "Regression: stateful fixed-capacity KV cache"
+    "$PYTHON" "$ROOT/tools/export_kv_cache.py" --output "$KV_MANIFEST"
+    "$COMPILER" --kv-cache "$KV_MANIFEST"
+
+    echo "Regression: Advisor protocol"
+    "$PYTHON" "$ROOT/tools/export_pytorch.py" --output "$MANIFEST"
+    "$COMPILER" --import-pytorch "$MANIFEST" \
+      --emit-advisor-request "$BUILD_DIR/regression_advisor_request.json"
+
+    echo "Regression: generated-kernel contract"
+    "$COMPILER" --emit-kernel-contract \
+      "$BUILD_DIR/regression_silu_mul_contract.json" --pattern silu_mul
+
+    echo "Regression: stateful Transformer decode"
+    "$PYTHON" "$ROOT/tools/export_transformer_decode.py" \
+      --output "$DECODE_MANIFEST"
+    "$COMPILER" --transformer-decode "$DECODE_MANIFEST"
+
+    echo "Regression: decoder-only runtime"
+    "$PYTHON" "$ROOT/tools/export_decoder_llm.py" \
+      --output "$DECODER_LLM_MANIFEST"
+    "$COMPILER" --decoder-llm "$DECODER_LLM_MANIFEST" \
+      --kernel-library "$BUILD_DIR/generated_kernels"
+
+    echo "Regression: PASS"
     ;;
 esac

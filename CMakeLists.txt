@@ -65,6 +65,8 @@ endif()
 
 add_executable(TensorMetalCompiler
   apps/tensor_metal_main.cpp
+  apps/decoder_benchmark_main.hpp
+  apps/decoder_benchmark_main.cpp
   apps/decoder_llm_main.hpp
   apps/decoder_llm_main.cpp
   apps/generated_kernel_main.hpp

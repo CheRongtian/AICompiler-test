@@ -1,4 +1,5 @@
 #include "backend/metal/MetalRuntime.hpp"
+#include "decoder_benchmark_main.hpp"
 #include "decoder_llm_main.hpp"
 #include "generated_kernel_main.hpp"
 #include "kv_cache_main.hpp"
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -32,6 +34,15 @@ kernel void vector_add(device const float *lhs [[buffer(0)]],
 
 const char *passFail(bool passed) {
   return passed ? "PASS" : "FAIL";
+}
+
+std::size_t parseCount(const char *text, const std::string &name) {
+  std::size_t consumed = 0;
+  const auto value = std::stoull(text, &consumed);
+  if (consumed != std::string(text).size() || value == 0) {
+    throw std::invalid_argument(name + " must be a positive integer.");
+  }
+  return static_cast<std::size_t>(value);
 }
 
 bool printPipelineResult(const tensor::metal::ComputePipelineResult &result) {
@@ -123,6 +134,22 @@ int main(int argc, char **argv) {
       advisor.responsePath = argv[4];
       return runImportedPyTorchGraph(runtime, argv[2], std::cout, advisor) ? 0 : 1;
     }
+    if (argc == 3 && std::string(argv[1]) == "--benchmark-import-pytorch") {
+      PyTorchAdvisorOptions options;
+      options.benchmarkWarmupRuns = 2;
+      options.benchmarkMeasuredRuns = 10;
+      options.benchmarkLabel = "Advisor off (deterministic exhaustive search)";
+      return runImportedPyTorchGraph(runtime, argv[2], std::cout, options) ? 0 : 1;
+    }
+    if (argc == 5 && std::string(argv[1]) == "--benchmark-import-pytorch" &&
+        std::string(argv[3]) == "--advisor-response") {
+      PyTorchAdvisorOptions options;
+      options.responsePath = argv[4];
+      options.benchmarkWarmupRuns = 2;
+      options.benchmarkMeasuredRuns = 10;
+      options.benchmarkLabel = "Advisor on (LLM-guided Top-K)";
+      return runImportedPyTorchGraph(runtime, argv[2], std::cout, options) ? 0 : 1;
+    }
     if (argc == 3 && std::string(argv[1]) == "--kv-cache") {
       return runKVCacheWorkload(runtime, argv[2], std::cout) ? 0 : 1;
     }
@@ -135,6 +162,16 @@ int main(int argc, char **argv) {
     if (argc == 5 && std::string(argv[1]) == "--decoder-llm" &&
         std::string(argv[3]) == "--kernel-library") {
       return runDecoderLLMWorkload(runtime, argv[2], std::cout, argv[4]) ? 0 : 1;
+    }
+    if (argc == 9 && std::string(argv[1]) == "--benchmark-decoder-llm" &&
+        std::string(argv[3]) == "--kernel-library" &&
+        std::string(argv[5]) == "--warmup" &&
+        std::string(argv[7]) == "--samples") {
+      DecoderBenchmarkOptions options;
+      options.kernelLibrary = argv[4];
+      options.warmupRuns = parseCount(argv[6], "warmup runs");
+      options.measuredRuns = parseCount(argv[8], "measured runs");
+      return runDecoderLLMBenchmark(runtime, argv[2], std::cout, options) ? 0 : 1;
     }
     if (argc == 3 && std::string(argv[1]) == "--emit-kernel-contract") {
       return emitGeneratedKernelContract(runtime, argv[2], std::cout) ? 0 : 1;
@@ -166,9 +203,13 @@ int main(int argc, char **argv) {
                 << " [--import-pytorch <graph-manifest>]"
                    " [--import-pytorch <graph-manifest> --emit-advisor-request <json>]"
                    " [--import-pytorch <graph-manifest> --advisor-response <json>]"
+                   " [--benchmark-import-pytorch <graph-manifest>"
+                   " [--advisor-response <json>]]"
                    " [--kv-cache <cache-manifest>]"
                    " [--transformer-decode <decoder-manifest>]"
                    " [--decoder-llm <decoder-manifest> [--kernel-library <directory>]]"
+                   " [--benchmark-decoder-llm <decoder-manifest>"
+                   " --kernel-library <directory> --warmup <runs> --samples <runs>]"
                    " [--emit-kernel-contract <json> [--pattern <pattern>]]"
                    " [--admit-generated-kernel <json> --feedback-output <json>"
                    " --pattern <pattern> [--artifact-output <json>]]\n";

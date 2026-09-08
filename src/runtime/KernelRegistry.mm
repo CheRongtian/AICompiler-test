@@ -98,6 +98,9 @@ std::size_t KernelRegistry::track(KernelUsage usage) {
 void KernelRegistry::completed(const std::vector<std::size_t> &uses) {
   for (auto index : uses) ++usage_.at(index).completedCalls;
 }
+void KernelRegistry::resetUsage() noexcept {
+  for (auto &use : usage_) use.completedCalls = 0;
+}
 void KernelRegistry::report(std::ostream &log) const {
   std::size_t generated = 0, templates = 0;
   log << "Decoder kernel runtime usage audit:\n";

@@ -3,13 +3,16 @@
 #include "backend/metal/MetalRuntime.hpp"
 
 #include <cstddef>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace tensor::benchmark {
 
 struct Statistics {
   std::size_t samples = 0;
   double medianUs = 0.0;
+  double p90Us = 0.0;
   double minUs = 0.0;
   double maxUs = 0.0;
 };
@@ -27,6 +30,10 @@ struct PairedResult {
   double speedup = 0.0;
   std::string errorMessage;
 };
+
+// Summarizes already-collected timing samples. Empty input has no statistics.
+[[nodiscard]] std::optional<Statistics>
+summarizeTimings(const std::vector<double> &values);
 
 // Empty string means every warmup submission completed successfully.
 [[nodiscard]] std::string warmup(const metal::PreparedExecution &execution,

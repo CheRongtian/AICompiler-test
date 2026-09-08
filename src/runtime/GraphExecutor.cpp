@@ -321,6 +321,7 @@ CompiledGraph::CompiledGraph(planner::ProgramPlan plan,
 GraphExecutionResult CompiledGraph::run() const {
   GraphExecutionResult result;
   double gpuSum = 0.0;
+  double cpuSum = 0.0;
   bool timestamps = true;
   for (const auto &unit : units_) {
     const auto execution = unit.execution->execute();
@@ -330,11 +331,13 @@ GraphExecutionResult CompiledGraph::run() const {
     }
     if (execution.gpuExecutionTimeUs) gpuSum += *execution.gpuExecutionTimeUs;
     else timestamps = false;
+    cpuSum += execution.cpuSubmitToCompletionTimeUs;
   }
   for (auto output : plan_.graph.analyzed.graph.outputs) {
     result.outputs.push_back(logicalRead(buffers_[output], plan_.graph.analyzed.types[output]));
   }
   if (timestamps) result.gpuExecutionTimeUs = gpuSum;
+  result.cpuSubmitToCompletionTimeUs = cpuSum;
   result.passed = true;
   return result;
 }

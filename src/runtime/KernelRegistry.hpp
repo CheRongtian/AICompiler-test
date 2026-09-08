@@ -29,6 +29,7 @@ public:
   [[nodiscard]] const llm::GeneratedKernelResponse *find(const std::string &pattern) const;
   std::size_t track(KernelUsage usage);
   void completed(const std::vector<std::size_t> &uses);
+  void resetUsage() noexcept;
   void report(std::ostream &log) const;
 
 private:

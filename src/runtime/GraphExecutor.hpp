@@ -12,6 +12,7 @@ struct GraphExecutionResult {
   bool passed = false;
   std::vector<std::vector<float>> outputs;
   std::optional<double> gpuExecutionTimeUs;
+  double cpuSubmitToCompletionTimeUs = 0.0;
   std::string errorMessage;
 };
 

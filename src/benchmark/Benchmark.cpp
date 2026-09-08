@@ -7,13 +7,21 @@
 namespace tensor::benchmark {
 namespace {
 
+double percentile(const std::vector<double> &values, double fraction) {
+  const double position = fraction * static_cast<double>(values.size() - 1);
+  const auto lower = static_cast<std::size_t>(position);
+  const auto upper = std::min(lower + 1, values.size() - 1);
+  const double weight = position - static_cast<double>(lower);
+  return values[lower] * (1.0 - weight) + values[upper] * weight;
+}
+
 Statistics summarize(std::vector<double> values) {
   std::sort(values.begin(), values.end());
   const std::size_t count = values.size();
   const double median = count % 2 == 0
                             ? (values[count / 2 - 1] + values[count / 2]) / 2.0
                             : values[count / 2];
-  return {count, median, values.front(), values.back()};
+  return {count, median, percentile(values, 0.90), values.front(), values.back()};
 }
 
 template <typename Execution>
@@ -88,6 +96,12 @@ PairedResult measurePairImpl(const Execution &baseline, const Execution &candida
 }
 
 } // namespace
+
+std::optional<Statistics>
+summarizeTimings(const std::vector<double> &values) {
+  if (values.empty()) return std::nullopt;
+  return summarize(values);
+}
 
 std::string warmup(const metal::PreparedExecution &execution, std::size_t iterations) {
   return warmupImpl(execution, iterations);

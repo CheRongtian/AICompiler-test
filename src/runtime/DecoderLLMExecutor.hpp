@@ -36,6 +36,7 @@ public:
   [[nodiscard]] std::vector<float> readKeyPrefix(std::size_t layer) const;
   [[nodiscard]] std::vector<float> readValuePrefix(std::size_t layer) const;
   [[nodiscard]] bool cacheStorageReused() const noexcept;
+  void resetKernelUsage() noexcept;
   void reportKernelUsage(std::ostream &log) const;
 
 private:

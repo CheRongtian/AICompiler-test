@@ -1,6 +1,7 @@
 #include "pytorch_import_main.hpp"
 
 #include "importer/PyTorchImporter.hpp"
+#include "benchmark/Benchmark.hpp"
 #include "llm/AdvisorProtocol.hpp"
 #include "planner/KernelPlan.hpp"
 #include "planner/RegionPlan.hpp"
@@ -9,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <iomanip>
 #include <optional>
 #include <ostream>
@@ -27,6 +29,62 @@ std::pair<double, double> tolerance(tensor::DType dtype) {
 
 bool sameType(const tensor::TensorType &left, const tensor::TensorType &right) {
   return left.shape == right.shape && left.dtype == right.dtype;
+}
+
+void printTiming(const std::string &label,
+                 const std::vector<double> &values, std::ostream &log) {
+  const auto stats = tensor::benchmark::summarizeTimings(values);
+  if (!stats) {
+    log << label << ": unavailable\n";
+    return;
+  }
+  log << label << ": p50=" << stats->medianUs
+      << ", p90=" << stats->p90Us << ", min=" << stats->minUs
+      << ", max=" << stats->maxUs << ", samples=" << stats->samples
+      << '\n';
+}
+
+bool benchmarkGraph(const tensor::runtime::CompiledGraph &graph,
+                    const PyTorchAdvisorOptions &options,
+                    std::ostream &log) {
+  if (options.benchmarkMeasuredRuns == 0) return true;
+  for (std::size_t run = 0; run < options.benchmarkWarmupRuns; ++run) {
+    const auto result = graph.run();
+    if (!result.passed) {
+      log << "Imported graph benchmark warmup: FAIL\n"
+          << "Metal error: " << result.errorMessage << '\n';
+      return false;
+    }
+  }
+
+  std::vector<double> gpuTimes;
+  std::vector<double> cpuTimes;
+  std::vector<double> endToEndTimes;
+  for (std::size_t run = 0; run < options.benchmarkMeasuredRuns; ++run) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto result = graph.run();
+    const auto end = std::chrono::steady_clock::now();
+    if (!result.passed) {
+      log << "Imported graph benchmark: FAIL\n"
+          << "Metal error: " << result.errorMessage << '\n';
+      return false;
+    }
+    if (result.gpuExecutionTimeUs) gpuTimes.push_back(*result.gpuExecutionTimeUs);
+    cpuTimes.push_back(result.cpuSubmitToCompletionTimeUs);
+    endToEndTimes.push_back(
+        std::chrono::duration<double, std::micro>(end - start).count());
+  }
+
+  log << "Imported graph benchmark: "
+      << (options.benchmarkLabel.empty() ? "unnamed" : options.benchmarkLabel)
+      << '\n'
+      << "Warmup runs: " << options.benchmarkWarmupRuns
+      << ", measured runs: " << options.benchmarkMeasuredRuns << '\n';
+  printTiming("  GPU command time (us)", gpuTimes, log);
+  printTiming("  CPU submit-to-completion time (us)", cpuTimes, log);
+  printTiming("  End-to-end time (us)", endToEndTimes, log);
+  log << "Imported graph benchmark validation: PASS\n";
+  return true;
 }
 
 } // namespace
@@ -159,5 +217,6 @@ bool runImportedPyTorchGraph(tensor::metal::MetalRuntime &runtime,
     log << "Imported graph GPU time (us): " << *execution.gpuExecutionTimeUs << '\n';
   }
   log << "PyTorch graph validation: " << passFail(metalPassed) << '\n';
-  return metalPassed;
+  if (!metalPassed) return false;
+  return benchmarkGraph(*compilation.executable, advisor, log);
 }

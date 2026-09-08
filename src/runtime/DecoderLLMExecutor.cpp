@@ -511,6 +511,10 @@ bool CompiledDecoderLLM::cacheStorageReused() const noexcept {
   return true;
 }
 
+void CompiledDecoderLLM::resetKernelUsage() noexcept {
+  impl_->registry.resetUsage();
+}
+
 void CompiledDecoderLLM::reportKernelUsage(std::ostream &log) const {
   impl_->registry.report(log);
 }

@@ -7,6 +7,8 @@ AICompiler/
 ├── apps/
 │   ├── generated_kernel_main.cpp
 │   ├── generated_kernel_main.hpp
+│   ├── decoder_benchmark_main.cpp
+│   ├── decoder_benchmark_main.hpp
 │   ├── decoder_llm_main.cpp
 │   ├── decoder_llm_main.hpp
 │   ├── main.cpp
@@ -80,11 +82,13 @@ AICompiler/
 │   ├── KVCache.py
 │   ├── MOE.py
 │   ├── decoder_llm.py
+│   ├── test_model.py
 │   └── transformer_kv_benchmark.py
 ├── tools/
 │   ├── export_kv_cache.py
 │   ├── export_decoder_llm.py
 │   ├── export_transformer_decode.py
+│   ├── benchmark_decoder_mps.py
 │   ├── llm_advisor.py
 │   ├── llm_kernel_generator.py
 │   └── export_pytorch.py
@@ -99,8 +103,7 @@ AICompiler/
 │   └── 2606.07665v2.pdf
 ├── tests/models/
 │   │     ├── test_linear.py
-│   │     ├── test_mlp.py
-│   │     └── test_model.py
+│   │     └── test_mlp.py
 │   └── test.sh
 ├── .env.example
 ├── CMakeLists.txt
@@ -258,3 +261,19 @@ Update the Kernel Generator system prompt for the group-dispatch rules, then run
 
 To generate one pattern, use e.g. `./run.sh generate decoder_residual_rmsnorm`.
 Generation uses the same remote Workflow for all six patterns. Decoder execution itself makes no API calls. Look for `generated` entries with nonzero `completed_calls` and `Decoder-only validation: PASS`. If all candidates fall back, the audit reports zero generated dispatches; that does not establish successful generated-kernel integration on hardware.
+
+### Benchmark and ablation
+
+- Uses two warmup runs and ten measured runs, with alternating template/generated order for the Metal decoder comparison.
+- Reports prefill and decode p50/p90, GPU command time, CPU submit-to-completion time, end-to-end time, tokens/s, and fixed KV storage.
+- Compares template-only and generated-enabled decoder plans and prints a measured-only runtime usage audit.
+- Runs the PyTorch reference on MPS with synchronized timing over the same logits/token readback and autoregressive token-feedback scope; Metal GPU timestamps and MPS synchronized wall timing are reported separately.
+- Advisor ablation benchmarks deterministic exhaustive search and LLM-guided Top-K plans. The regression command covers local compiler/runtime paths without contacting either remote Workflow.
+
+```bash
+./run.sh benchmark
+./run.sh ablation
+./run.sh regression
+```
+
+AgentCompile evaluates CUDA/A800 mechanisms. This project evaluates the corresponding compiler and runtime principles on Apple M3 Pro, Metal, and unified memory; the reported measurements describe these Metal implementations.
