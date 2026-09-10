@@ -1,6 +1,7 @@
 #pragma once
 
 #include "backend/metal/MetalRuntime.hpp"
+#include "runtime/DecoderLLMModelResources.hpp"
 #include "tensor/DecoderLLM.hpp"
 
 #include <cstdint>
@@ -20,6 +21,11 @@ struct DecoderLLMCompileOptions {
   std::size_t kvPageSize = 0;
   std::size_t prefillChunkSize = 0;
   std::vector<std::shared_ptr<KVPagePool>> sharedKVPools;
+  DType storageDtype = DType::Float32;
+  std::optional<DType> requestedStorageDtype;
+  bool allowPrecisionFallback = false;
+  bool enableFusion = true;
+  std::shared_ptr<DecoderLLMModelResources> sharedModelResources;
 };
 
 struct DecoderKVSnapshot {
@@ -44,10 +50,12 @@ public:
   CompiledDecoderLLM &operator=(const CompiledDecoderLLM &) = delete;
 
   [[nodiscard]] std::string reset();
-  [[nodiscard]] DecoderLLMRunResult prefill(const std::vector<float> &tokenIds);
+  [[nodiscard]] DecoderLLMRunResult prefill(const std::vector<float> &tokenIds,
+                                          bool readLogits = true);
   [[nodiscard]] DecoderLLMRunResult
   prefillChunked(const std::vector<float> &tokenIds);
-  [[nodiscard]] DecoderLLMRunResult decode(const std::vector<float> &tokenIds);
+  [[nodiscard]] DecoderLLMRunResult decode(const std::vector<float> &tokenIds,
+                                         bool readLogits = true);
 
   [[nodiscard]] std::size_t currentLength() const noexcept;
   [[nodiscard]] std::vector<float> readKeyPrefix(std::size_t layer) const;
@@ -57,6 +65,13 @@ public:
   [[nodiscard]] std::size_t kvPageSize() const noexcept;
   [[nodiscard]] std::size_t prefillChunkSize() const noexcept;
   [[nodiscard]] std::size_t allocatedKVPageCount() const noexcept;
+  [[nodiscard]] DType storageDtype() const noexcept;
+  [[nodiscard]] bool precisionFallbackUsed() const noexcept;
+  [[nodiscard]] std::size_t modelStorageBytes() const noexcept;
+  [[nodiscard]] std::size_t kvStorageBytes() const noexcept;
+  [[nodiscard]] std::size_t activationStorageBytes() const noexcept;
+  [[nodiscard]] std::shared_ptr<DecoderLLMModelResources>
+  sharedModelResources() const noexcept;
   [[nodiscard]] std::vector<std::int32_t>
   kvBlockTable(std::size_t layer) const;
   [[nodiscard]] DecoderKVSnapshot snapshotKVCache() const;

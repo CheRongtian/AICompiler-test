@@ -30,6 +30,7 @@ struct DecoderLLMReference {
 struct DecoderLLMWorkload {
   std::string modelName;
   planner::DecoderLLMPlan plan;
+  DType requestedStorageDtype = DType::Float32;
   std::size_t decodeCount = 0;
   std::vector<float> embeddingWeight;
   std::vector<float> finalNormWeight;

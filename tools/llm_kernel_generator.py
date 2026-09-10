@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -147,7 +148,7 @@ def main():
     parser.add_argument(
         "--env-file", type=Path, default=PROJECT_ROOT / ".env"
     )
-    parser.add_argument("--pattern", choices=PATTERNS, default="silu_mul")
+    parser.add_argument("--pattern", default="silu_mul")
     args = parser.parse_args()
 
     _load_env(args.env_file)
@@ -166,7 +167,12 @@ def main():
         raise GeneratorError("Unsupported principle library version.")
     common = library.get("common")
     patterns = library.get("patterns")
-    specific = patterns.get(args.pattern) if isinstance(patterns, dict) else None
+    base_pattern = re.sub(r"_(fp16|bf16)$", "", args.pattern)
+    if args.pattern != base_pattern and not base_pattern.startswith("decoder_"):
+        raise GeneratorError("Low-precision generation currently requires a decoder pattern.")
+    principle_key = ("decoder_gemv_64_64" if re.fullmatch(r"decoder_gemv_[1-9][0-9]*_[1-9][0-9]*", base_pattern)
+                     else base_pattern)
+    specific = patterns.get(principle_key) if isinstance(patterns, dict) else None
     if not isinstance(common, list) or not isinstance(specific, list):
         raise GeneratorError("Missing common or pattern-specific principles.")
     if not all(isinstance(value, str) for value in common + specific):

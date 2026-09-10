@@ -10,8 +10,12 @@
 
 namespace tensor {
 
-enum class DType { Float16, Float32, Int32 };
+enum class DType { Float16, Float32, BFloat16, Int32 };
 enum class Layout { Contiguous, Strided };
+
+[[nodiscard]] const char *dtypeName(DType dtype);
+[[nodiscard]] bool isFloatingDType(DType dtype);
+[[nodiscard]] std::size_t dtypeStorageBytes(DType dtype);
 
 // Static tensors. Strides are expressed in elements; an empty shape is a scalar.
 struct TensorType {

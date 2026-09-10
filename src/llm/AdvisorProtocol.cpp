@@ -54,15 +54,6 @@ bool hasRMSNorm(const planner::RegionPlan &region) {
                      });
 }
 
-const char *dtypeName(DType dtype) {
-  switch (dtype) {
-  case DType::Float16: return "float16";
-  case DType::Float32: return "float32";
-  case DType::Int32: return "int32";
-  }
-  throw std::invalid_argument("Unknown tensor dtype.");
-}
-
 const char *layoutName(Layout layout) {
   return layout == Layout::Contiguous ? "contiguous" : "strided";
 }
@@ -130,7 +121,7 @@ void writeTensor(std::ostream &output, ValueId value,
                  const TensorType &type) {
   output << "{\"value_id\":" << value << ",\"shape\":";
   writeSizeArray(output, type.shape);
-  output << ",\"dtype\":\"" << dtypeName(type.dtype)
+  output << ",\"dtype\":\"" << tensor::dtypeName(type.dtype)
          << "\",\"layout\":\"" << layoutName(type.layout)
          << "\",\"strides\":";
   writeSizeArray(output, type.strides());

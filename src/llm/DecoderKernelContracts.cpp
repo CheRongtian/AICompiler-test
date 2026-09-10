@@ -9,6 +9,8 @@
 
 namespace tensor::llm {
 namespace {
+constexpr std::size_t kMaximumGeneratedGEMVWeightElements = 8u * 1024u * 1024u;
+
 planner::DecoderLLMPlan decoderPlan() {
   planner::DecoderLLMPlan plan;
   plan.attention = {1, 4, 16, 32, 8, DType::Float32, 128};
@@ -34,7 +36,93 @@ std::pair<std::size_t, std::size_t> gemvShape(const std::string &pattern) {
   if (pattern == "decoder_gemv_64_64") return {64,64};
   if (pattern == "decoder_gemv_64_128") return {64,128};
   if (pattern == "decoder_gemv_128_64") return {128,64};
+  const std::string prefix="decoder_gemv_";
+  if (pattern.rfind(prefix,0)==0) {
+    const auto split=pattern.find('_',prefix.size());
+    if(split==std::string::npos) throw std::invalid_argument("Expected decoder_gemv_K_N.");
+    std::size_t usedK=0,usedN=0;
+    const auto k=std::stoull(pattern.substr(prefix.size(),split-prefix.size()),&usedK);
+    const auto n=std::stoull(pattern.substr(split+1),&usedN);
+    if(!k || !n || usedK!=split-prefix.size() || usedN!=pattern.size()-split-1)
+      throw std::invalid_argument("Invalid GEMV contract dimensions.");
+    return {k,n};
+  }
   return {0,0};
+}
+
+std::string baselineName(std::size_t threads, std::size_t vectorWidth,
+                         bool simdgroup) {
+  return "threads=" + std::to_string(threads) +
+         ", vector=" + std::to_string(vectorWidth) +
+         ", simdgroup=" + (simdgroup ? "true" : "false");
+}
+
+metal::GeneratedKernel emitDecoderLinearBaseline(
+    std::size_t inputSize, std::size_t outputSize, std::size_t threads,
+    std::size_t vectorWidth, bool simdgroup, metal::ElementType storageType,
+    const std::string &functionName) {
+  if (vectorWidth == 0) {
+    return metal::emitLinearBaseline(1, inputSize, outputSize, threads,
+                                     functionName, storageType, 1,
+                                     storageType);
+  }
+  return metal::emitDecodeGEMV(
+      1, inputSize, outputSize, {threads, vectorWidth, 0, simdgroup},
+      functionName, storageType, storageType);
+}
+
+KernelBaseline makeGEMVBaseline(
+    std::size_t inputSize, std::size_t outputSize, std::size_t threads,
+    std::size_t vectorWidth, bool simdgroup,
+    metal::ElementType storageType) {
+  KernelBaseline baseline;
+  baseline.name = baselineName(threads, vectorWidth, simdgroup);
+  baseline.steps = {{emitDecoderLinearBaseline(
+                         inputSize, outputSize, threads, vectorWidth,
+                         simdgroup, storageType, "template_decoder_gemv"),
+                     {0, 1}, {2}}};
+  return baseline;
+}
+
+KernelBaseline makeGatedMLPBaseline(
+    std::size_t threads, std::size_t vectorWidth, bool simdgroup,
+    metal::ElementType storageType) {
+  KernelBaseline baseline;
+  baseline.name = baselineName(threads, vectorWidth, simdgroup);
+  baseline.intermediateCounts = {128, 128};
+  baseline.steps = {
+      {emitDecoderLinearBaseline(64, 128, threads, vectorWidth, simdgroup,
+                                 storageType, "template_gate"),
+       {0, 1}, {4}},
+      {emitDecoderLinearBaseline(64, 128, threads, vectorWidth, simdgroup,
+                                 storageType, "template_up"),
+       {0, 2}, {5}},
+      {metal::emitDecoderSiLUMul(128, threads, "template_gated",
+                                 storageType),
+       {4, 5}, {3}}};
+  return baseline;
+}
+
+KernelBaseline makeFusedBaseline(const std::string &pattern,
+                                 std::size_t threads,
+                                 metal::ElementType storageType) {
+  KernelBaseline baseline;
+  baseline.name = "fused threads=" + std::to_string(threads);
+  if (pattern == "decoder_residual_rmsnorm") {
+    baseline.steps = {{metal::emitDecoderResidualRMSNorm(
+                           1, 64, 1e-5f, threads,
+                           "template_fused_residual_norm", storageType),
+                       {0, 1, 2}, {3, 4}}};
+    return baseline;
+  }
+  if (pattern == "decoder_gated_mlp") {
+    baseline.steps = {{metal::emitDecoderGatedMLP(
+                           1, 64, 128, threads, "template_fused_gated",
+                           storageType),
+                       {0, 1, 2}, {3}}};
+    return baseline;
+  }
+  throw std::invalid_argument("Missing fused decoder baseline: " + pattern);
 }
 }
 
@@ -49,6 +137,11 @@ KernelContract makeDecoderKernelContract(const std::string &pattern) {
   c.applicability = "Decoder-only fp32, batch=1, sequence_length=1; no prefill replacement";
   const auto [k,n] = gemvShape(pattern);
   if (k) {
+    if (n > kMaximumGeneratedGEMVWeightElements / k) {
+      throw std::invalid_argument(
+          "Generated GEMV contract fixture exceeds 8M weight elements; "
+          "the local template planner remains available for this model shape.");
+    }
     c.inputNames = {"input", "weight"};
     c.outputNames = {"output"};
     c.workItem = "one output feature per threadgroup; reduce over K";
@@ -153,49 +246,86 @@ KernelContract makeDecoderKernelContract(const std::string &pattern) {
 }
 
 std::vector<KernelBaseline> makeDecoderBaselines(
-    const KernelContract &c, const KernelCase &data) {
+    const KernelContract &contract, const KernelCase &) {
+  auto normalizedContract = contract;
+  if (normalizedContract.storageType != metal::ElementType::Float32) {
+    normalizedContract.pattern.resize(normalizedContract.pattern.size() - 5);
+  }
+
   std::vector<KernelBaseline> result;
-  const auto [k,n] = gemvShape(c.pattern);
-  if (k || c.pattern == "decoder_gated_mlp") {
-    // Include generic Linear and all deterministic GEMV implementations.
-    for (auto threads : c.workgroupSizes) {
-      for (std::size_t width : {0u,1u,4u}) {
-        auto linear = [&](std::size_t in, std::size_t out, const std::string &name) {
-          return width == 0 ? metal::emitLinearBaseline(1,in,out,threads,name)
-                            : metal::emitDecodeGEMV(1,in,out,{threads,width},name);
-        };
-        KernelBaseline baseline;
-        baseline.name = "threads="+std::to_string(threads)+", vector="+std::to_string(width);
-        if (k) {
-          baseline.steps = {{linear(k,n,"template_decoder_gemv"), {0,1}, {2}}};
-        } else {
-          baseline.intermediateCounts = {128,128};
-          baseline.steps = {
-              {linear(64,128,"template_gate"), {0,1}, {4}},
-              {linear(64,128,"template_up"), {0,2}, {5}},
-              {metal::emitDecoderSiLUMul(128,threads,"template_gated"), {4,5}, {3}}};
+  const auto shape = gemvShape(normalizedContract.pattern);
+  const auto inputSize = shape.first;
+  const auto outputSize = shape.second;
+  const bool isGEMV = inputSize != 0;
+  const bool isGatedMLP =
+      normalizedContract.pattern == "decoder_gated_mlp";
+
+  if (isGEMV || isGatedMLP) {
+    for (const auto threads : normalizedContract.workgroupSizes) {
+      for (const std::size_t vectorWidth : {0u, 1u, 4u}) {
+        if (isGEMV && vectorWidth != 0 && inputSize % vectorWidth != 0) {
+          continue;
         }
-        result.push_back(std::move(baseline));
+        result.push_back(
+            isGEMV
+                ? makeGEMVBaseline(inputSize, outputSize, threads,
+                                   vectorWidth, false,
+                                   normalizedContract.storageType)
+                : makeGatedMLPBaseline(threads, vectorWidth, false,
+                                       normalizedContract.storageType));
+      }
+      if (threads == 32) {
+        for (const std::size_t vectorWidth : {1u, 4u}) {
+          if (isGEMV && inputSize % vectorWidth != 0) {
+            continue;
+          }
+          result.push_back(
+              isGEMV
+                  ? makeGEMVBaseline(inputSize, outputSize, threads,
+                                     vectorWidth, true,
+                                     normalizedContract.storageType)
+                  : makeGatedMLPBaseline(threads, vectorWidth, true,
+                                         normalizedContract.storageType));
+        }
       }
     }
   } else {
-    for (auto threads : c.workgroupSizes) {
+    for (const auto threads : normalizedContract.workgroupSizes) {
       KernelBaseline baseline;
-      baseline.name = "threads="+std::to_string(threads);
-      if (c.pattern == "decoder_rope") {
+      baseline.name = "threads=" + std::to_string(threads);
+      if (normalizedContract.pattern == "decoder_rope") {
         auto plan = decoderPlan();
         plan.attention.threadsPerThreadgroup = threads;
         baseline.steps = {
-            {metal::emitDecoderRoPE(plan,1,"template_decoder_q_rope"), {0,2,3,4}, {5}},
-            {metal::emitDecoderRoPE(plan,1,"template_decoder_k_rope"), {1,2,3,4}, {6}}};
-      } else if (c.pattern == "decoder_residual_rmsnorm") {
+            {metal::emitDecoderRoPE(plan, 1, "template_decoder_q_rope",
+                                    normalizedContract.storageType),
+             {0, 2, 3, 4}, {5}},
+            {metal::emitDecoderRoPE(plan, 1, "template_decoder_k_rope",
+                                    normalizedContract.storageType),
+             {1, 2, 3, 4}, {6}}};
+      } else if (normalizedContract.pattern ==
+                 "decoder_residual_rmsnorm") {
         baseline.steps = {
-            {metal::emitDecoderAdd(64,threads,"template_residual"), {0,1}, {3}},
-            {metal::emitDecoderRMSNorm(1,64,1e-5f,threads,"template_residual_norm"), {3,2}, {4}}};
+            {metal::emitDecoderAdd(64, threads, "template_residual",
+                                   normalizedContract.storageType),
+             {0, 1}, {3}},
+            {metal::emitDecoderRMSNorm(
+                 1, 64, 1e-5f, threads, "template_residual_norm",
+                 normalizedContract.storageType),
+             {3, 2}, {4}}};
       } else {
-        throw std::invalid_argument("Missing decoder baseline: "+c.pattern);
+        throw std::invalid_argument("Missing decoder baseline: " +
+                                    normalizedContract.pattern);
       }
       result.push_back(std::move(baseline));
+    }
+  }
+
+  if (normalizedContract.pattern == "decoder_residual_rmsnorm" ||
+      normalizedContract.pattern == "decoder_gated_mlp") {
+    for (const auto threads : normalizedContract.workgroupSizes) {
+      result.push_back(makeFusedBaseline(normalizedContract.pattern, threads,
+                                         normalizedContract.storageType));
     }
   }
   return result;

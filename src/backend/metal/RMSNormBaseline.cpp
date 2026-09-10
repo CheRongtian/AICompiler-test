@@ -12,6 +12,10 @@ namespace tensor::metal {
 
 GeneratedKernel emitRMSNormBaseline(const RMSNormOp &op) {
   op.validate();
+  if (op.input.dtype == DType::BFloat16) {
+    throw std::invalid_argument(
+        "Generic Metal RMSNorm baseline does not support bf16 arithmetic.");
+  }
   const std::size_t elementCount = op.input.elementCount();
   const std::size_t width = op.input.shape.back();
   constexpr std::size_t kThreads = 256;

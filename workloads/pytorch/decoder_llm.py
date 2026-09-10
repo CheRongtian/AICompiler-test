@@ -13,19 +13,22 @@ class RMSNorm(nn.Module):
 
     def forward(self, value):
         scale = torch.rsqrt(value.float().pow(2).mean(dim=-1, keepdim=True) + self.epsilon)
-        return value * scale.to(value.dtype) * self.weight
+        return (value.float() * scale * self.weight.float()).to(value.dtype)
 
 
 def apply_interleaved_rope(value, cosine, sine, start):
     sequence_length = value.size(2)
     cosine = cosine[start : start + sequence_length].view(1, 1, sequence_length, -1)
     sine = sine[start : start + sequence_length].view(1, 1, sequence_length, -1)
-    even = value[..., 0::2]
-    odd = value[..., 1::2]
+    # RoPE tables remain fp32 for numerical stability.  Rotate in fp32 and
+    # convert the result back to the activation storage dtype, matching the
+    # Metal decoder kernels.
+    even = value[..., 0::2].float()
+    odd = value[..., 1::2].float()
     rotated = torch.stack(
         (even * cosine - odd * sine, even * sine + odd * cosine), dim=-1
     )
-    return rotated.flatten(-2)
+    return rotated.flatten(-2).to(value.dtype)
 
 
 class CausalSelfAttention(nn.Module):
@@ -73,7 +76,7 @@ class CausalSelfAttention(nn.Module):
             new_value if past_value is None else torch.cat((past_value, new_value), dim=2)
         )
 
-        scores = torch.matmul(query, key_cache.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = torch.matmul(query.float(), key_cache.float().transpose(-2, -1)) / math.sqrt(self.head_dim)
         query_positions = torch.arange(
             previous_length,
             previous_length + sequence_length,
@@ -82,7 +85,7 @@ class CausalSelfAttention(nn.Module):
         key_positions = torch.arange(key_cache.size(2), device=value.device).view(1, -1)
         scores = scores.masked_fill(key_positions > query_positions, float("-inf"))
         probabilities = torch.softmax(scores, dim=-1)
-        context = torch.matmul(probabilities, value_cache)
+        context = torch.matmul(probabilities, value_cache.float()).to(value.dtype)
         context = context.transpose(1, 2).contiguous().view(batch, sequence_length, -1)
         return self.o_proj(context), key_cache, value_cache
 

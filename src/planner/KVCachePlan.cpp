@@ -33,11 +33,20 @@ void KVCachePlan::validate() const {
       prefillLength == 0 || prefillLength > capacity) {
     throw std::invalid_argument("KV cache dimensions and prefill length must be valid.");
   }
-  if (dtype != DType::Float32) {
-    throw std::invalid_argument("V5 KV cache currently supports fp32 only.");
+  if (dtype != DType::Float16 && dtype != DType::Float32 &&
+      dtype != DType::BFloat16) {
+    throw std::invalid_argument("KV cache storage dtype is unsupported.");
   }
   if (threadsPerThreadgroup == 0 || threadsPerThreadgroup > 1024) {
     throw std::invalid_argument("KV cache threadgroup size must be in [1, 1024].");
+  }
+  if ((threadsPerThreadgroup & (threadsPerThreadgroup - 1)) != 0) {
+    throw std::invalid_argument(
+        "KV cache threadgroup size must be a power of two.");
+  }
+  if (headDimension > threadsPerThreadgroup) {
+    throw std::invalid_argument(
+        "KV attention requires head dimension <= threadgroup size.");
   }
   (void)modelDimension();
   (void)cacheElementCount();

@@ -8,6 +8,16 @@
 namespace tensor::runtime {
 namespace {
 
+metal::ElementType metalStorageType(DType dtype) {
+  switch (dtype) {
+  case DType::Float16: return metal::ElementType::Float16;
+  case DType::Float32: return metal::ElementType::Float32;
+  case DType::BFloat16: return metal::ElementType::BFloat16;
+  case DType::Int32: return metal::ElementType::Int32;
+  }
+  throw std::invalid_argument("Unsupported KV cache storage dtype.");
+}
+
 std::size_t checkedMultiply(std::size_t left, std::size_t right) {
   if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left) {
     throw std::overflow_error("Paged KV storage size exceeds size_t capacity.");
@@ -98,9 +108,10 @@ KVPagePoolCreation createKVPagePool(metal::MetalRuntime &runtime,
     storageCount = checkedMultiply(storageCount, plan.batch);
     storageCount = checkedMultiply(storageCount, plan.heads);
     storageCount = checkedMultiply(storageCount, plan.headDimension);
-    auto key = runtime.createBuffer(storageCount);
+    const auto storageType = metalStorageType(plan.dtype);
+    auto key = runtime.createBuffer(storageCount, nullptr, storageType);
     if (!key.buffer) throw std::runtime_error(key.errorMessage);
-    auto value = runtime.createBuffer(storageCount);
+    auto value = runtime.createBuffer(storageCount, nullptr, storageType);
     if (!value.buffer) throw std::runtime_error(value.errorMessage);
     result.pool = std::shared_ptr<KVPagePool>(new KVPagePool(
         plan, pageSize, std::move(key.buffer), std::move(value.buffer),
@@ -386,9 +397,10 @@ KVCacheStateCreation createKVCacheState(metal::MetalRuntime &runtime,
       return createKVCacheState(runtime, plan, std::move(pool.pool));
     }
     const auto storageCount = plan.cacheElementCount();
-    auto key = runtime.createBuffer(storageCount);
+    const auto storageType = metalStorageType(plan.dtype);
+    auto key = runtime.createBuffer(storageCount, nullptr, storageType);
     if (!key.buffer) throw std::runtime_error(key.errorMessage);
-    auto value = runtime.createBuffer(storageCount);
+    auto value = runtime.createBuffer(storageCount, nullptr, storageType);
     if (!value.buffer) throw std::runtime_error(value.errorMessage);
     const float zero = 0.0f;
     auto length = runtime.createBuffer(1, &zero, metal::ElementType::Int32);

@@ -8,12 +8,20 @@
 #include <optional>
 #include <ostream>
 #include <set>
+#include <utility>
 #include <vector>
 
 namespace {
 
 constexpr double kAbsoluteTolerance = 1e-3;
 constexpr double kRelativeTolerance = 5e-3;
+
+std::pair<double, double> tolerances(tensor::DType dtype) {
+  if (dtype == tensor::DType::Float16 || dtype == tensor::DType::BFloat16) {
+    return {2e-2, 2e-2};
+  }
+  return {kAbsoluteTolerance, kRelativeTolerance};
+}
 
 const char *passFail(bool passed) { return passed ? "PASS" : "FAIL"; }
 
@@ -31,17 +39,19 @@ bool validate(const std::string &label, const std::vector<float> &actual,
 
 bool validateState(const tensor::runtime::CompiledDecoderLLM &decoder,
                    const tensor::DecoderLLMReference &reference,
-                   std::size_t expectedLength, std::ostream &log) {
+                   std::size_t expectedLength, std::ostream &log,
+                   double absoluteTolerance, double relativeTolerance) {
   bool passed = decoder.currentLength() == expectedLength;
   log << "  paged cache length: " << passFail(passed)
       << ", current_length=" << decoder.currentLength() << '\n';
   for (std::size_t layer = 0; layer < reference.keyCaches.size(); ++layer) {
     passed &= validate("  layer " + std::to_string(layer) + " key cache",
                        decoder.readKeyPrefix(layer), reference.keyCaches[layer],
-                       log);
+                       log, absoluteTolerance, relativeTolerance);
     passed &= validate("  layer " + std::to_string(layer) + " value cache",
                        decoder.readValuePrefix(layer),
-                       reference.valueCaches[layer], log);
+                       reference.valueCaches[layer], log, absoluteTolerance,
+                       relativeTolerance);
   }
   return passed;
 }
@@ -91,6 +101,9 @@ bool runPagedKVWorkload(tensor::metal::MetalRuntime &runtime,
   options.kernelLibrary = kernelLibrary;
   options.kvPageSize = pageSize;
   options.prefillChunkSize = chunkSize;
+  options.storageDtype = plan.attention.dtype;
+  options.requestedStorageDtype = workload.requestedStorageDtype;
+  options.allowPrecisionFallback = true;
   auto compilation =
       tensor::runtime::compileDecoderLLM(runtime, workload, log, options);
   if (!compilation.executable) {
@@ -99,11 +112,19 @@ bool runPagedKVWorkload(tensor::metal::MetalRuntime &runtime,
     return false;
   }
   auto &decoder = *compilation.executable;
+  const auto [absoluteTolerance, relativeTolerance] =
+      tolerances(decoder.storageDtype());
   const auto chunkCount =
       (plan.attention.prefillLength + chunkSize - 1) / chunkSize;
   log << "Paged KV configuration: page_size=" << pageSize
       << ", capacity=" << plan.attention.capacity
-      << ", chunk_size=" << chunkSize << ", chunks=" << chunkCount << '\n';
+      << ", chunk_size=" << chunkSize << ", chunks=" << chunkCount
+      << ", storage=" << tensor::dtypeName(decoder.storageDtype())
+      << ", precision_fallback="
+      << (decoder.precisionFallbackUsed() ? "true" : "false")
+      << ", model_bytes=" << decoder.modelStorageBytes()
+      << ", kv_bytes=" << decoder.kvStorageBytes()
+      << ", activation_bytes=" << decoder.activationStorageBytes() << '\n';
 
   bool passed = decoder.usesPagedKVCache() && decoder.kvPageSize() == pageSize &&
                 decoder.prefillChunkSize() == chunkSize;
@@ -117,11 +138,13 @@ bool runPagedKVWorkload(tensor::metal::MetalRuntime &runtime,
   }
   log << "Chunked prefill execution: PASS\n";
   passed &= validate("  full prefill logits", prefill.logits,
-                     workload.prefill.logits, log);
+                     workload.prefill.logits, log, absoluteTolerance,
+                     relativeTolerance);
   passed &= validate("  next token", prefill.nextTokenIds,
                      workload.prefill.nextTokenIds, log, 0.0, 0.0);
   passed &= validateState(decoder, workload.prefill,
-                          plan.attention.prefillLength, log);
+                          plan.attention.prefillLength, log,
+                          absoluteTolerance, relativeTolerance);
   const auto prefillPages =
       (plan.attention.prefillLength + pageSize - 1) / pageSize;
   const auto table = decoder.kvBlockTable(0);
@@ -148,11 +171,13 @@ bool runPagedKVWorkload(tensor::metal::MetalRuntime &runtime,
           << result.errorMessage << '\n';
       return false;
     }
-    bool stepPassed = validate("  logits", result.logits, reference.logits, log);
+    bool stepPassed = validate("  logits", result.logits, reference.logits, log,
+                               absoluteTolerance, relativeTolerance);
     stepPassed &= validate("  next token", result.nextTokenIds,
                            reference.nextTokenIds, log, 0.0, 0.0);
     stepPassed &= validateState(
-        decoder, reference, plan.attention.prefillLength + step + 1, log);
+        decoder, reference, plan.attention.prefillLength + step + 1, log,
+        absoluteTolerance, relativeTolerance);
     log << "Paged decode step " << step << ": " << passFail(stepPassed)
         << '\n';
     passed &= stepPassed;

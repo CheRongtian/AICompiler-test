@@ -40,11 +40,22 @@ Buffer allocate(metal::MetalRuntime &runtime, std::size_t count,
   return std::move(result.buffer);
 }
 
+metal::ElementType metalStorageType(DType dtype) {
+  switch (dtype) {
+  case DType::Float16: return metal::ElementType::Float16;
+  case DType::Float32: return metal::ElementType::Float32;
+  case DType::BFloat16: return metal::ElementType::BFloat16;
+  case DType::Int32: return metal::ElementType::Int32;
+  }
+  throw std::invalid_argument("Unsupported serving storage dtype.");
+}
+
 std::unique_ptr<metal::PreparedExecution> prepare(
     metal::MetalRuntime &runtime, const metal::GeneratedKernel &kernel,
     const std::vector<Buffer> &inputs,
-    const std::vector<metal::ElementType> &inputTypes, const Buffer &output,
-    metal::ElementType outputType) {
+    const std::vector<metal::ElementType> &inputTypes,
+    const std::vector<Buffer> &outputs,
+    const std::vector<metal::ElementType> &outputTypes) {
   const auto pipeline =
       runtime.createComputePipeline(kernel.source, kernel.functionName);
   if (!pipeline.pipelineCreationPassed) {
@@ -52,17 +63,27 @@ std::unique_ptr<metal::PreparedExecution> prepare(
                              pipeline.errorMessage);
   }
   const auto interfaceError =
-      metal::checkBufferInterface(pipeline, inputTypes, outputType);
+      metal::checkBufferInterface(pipeline, inputTypes, outputTypes);
   if (!interfaceError.empty()) {
     throw std::runtime_error(kernel.functionName + ": " + interfaceError);
   }
   auto result = runtime.prepareBuffers(
-      inputs, output,
+      inputs, outputs,
       {kernel.threadgroupCount, kernel.threadsPerThreadgroup});
   if (!result.execution) {
     throw std::runtime_error(kernel.functionName + ": " + result.errorMessage);
   }
   return std::move(result.execution);
+}
+
+std::unique_ptr<metal::PreparedExecution> prepare(
+    metal::MetalRuntime &runtime, const metal::GeneratedKernel &kernel,
+    const std::vector<Buffer> &inputs,
+    const std::vector<metal::ElementType> &inputTypes, const Buffer &output,
+    metal::ElementType outputType) {
+  return prepare(runtime, kernel, inputs, inputTypes,
+                 std::vector<Buffer>{output},
+                 std::vector<metal::ElementType>{outputType});
 }
 
 std::unique_ptr<metal::PreparedSequence> makeSequence(
@@ -99,29 +120,28 @@ struct BatchedDecodeRun {
   std::string errorMessage;
 };
 
-struct ServingLayerBuffers {
-  Buffer inputNormWeight;
-  Buffer queryWeight;
-  Buffer keyWeight;
-  Buffer valueWeight;
-  Buffer outputWeight;
-  Buffer postAttentionNormWeight;
-  Buffer gateWeight;
-  Buffer upWeight;
-  Buffer downWeight;
-};
-
 class BatchedDecodeExecutor {
 public:
   BatchedDecodeExecutor(
       metal::MetalRuntime &runtime, const DecoderLLMWorkload &workload,
       const std::vector<std::shared_ptr<KVPagePool>> &pools,
-      std::size_t maximumBatchSize, std::size_t pageSize)
+      std::size_t maximumBatchSize, std::size_t pageSize,
+      std::shared_ptr<DecoderLLMModelResources> modelResources)
       : runtime_(runtime), plan_(workload.plan), pools_(pools),
-        maximumBatchSize_(maximumBatchSize), pageSize_(pageSize) {
+        maximumBatchSize_(maximumBatchSize), pageSize_(pageSize),
+        storageType_(metalStorageType(workload.plan.attention.dtype)),
+        modelResources_(std::move(modelResources)) {
     if (maximumBatchSize_ == 0 || pageSize_ == 0 ||
         pools_.size() != plan_.layerCount ||
-        workload.layers.size() != plan_.layerCount) {
+        workload.layers.size() != plan_.layerCount || !modelResources_ ||
+        modelResources_->storageDtype != workload.plan.attention.dtype ||
+        modelResources_->layerCount != plan_.layerCount ||
+        modelResources_->hiddenSize != plan_.hiddenSize() ||
+        modelResources_->headCount != plan_.attention.heads ||
+        modelResources_->headDimension != plan_.attention.headDimension ||
+        modelResources_->cacheCapacity != plan_.attention.capacity ||
+        modelResources_->intermediateSize != plan_.intermediateSize ||
+        modelResources_->vocabularySize != plan_.vocabularySize) {
       throw std::invalid_argument(
           "Batched serving decoder configuration is invalid.");
     }
@@ -129,7 +149,7 @@ public:
     plan_.attention.batch = maximumBatchSize_;
     plan_.attention.prefillLength = 1;
     plan_.validate();
-    build(workload);
+    build();
   }
 
   [[nodiscard]] BatchedDecodeRun run(
@@ -205,19 +225,31 @@ public:
     return result;
   }
 
+  [[nodiscard]] std::size_t activationStorageBytes() const noexcept {
+    return activationStorageBytes_;
+  }
+
 private:
-  void build(const DecoderLLMWorkload &workload) {
+  void build() {
     const auto rows = maximumBatchSize_;
     const auto hidden = plan_.hiddenSize();
     const auto hiddenCount = rows * hidden;
     const auto intermediateCount = rows * plan_.intermediateSize;
     const auto threads = plan_.attention.threadsPerThreadgroup;
+    const auto storageBytes = dtypeStorageBytes(plan_.attention.dtype);
+
+    activationStorageBytes_ =
+        (3 * rows + 1 + plan_.layerCount * rows * maximumPages_) *
+            sizeof(std::int32_t) +
+        rows * plan_.vocabularySize * sizeof(float) +
+        (13 * hiddenCount + intermediateCount) * storageBytes;
 
     tokenIds_ = allocate(runtime_, rows, nullptr, metal::ElementType::Int32);
     validLengths_ =
         allocate(runtime_, rows, nullptr, metal::ElementType::Int32);
     activeCount_ = allocate(runtime_, 1, nullptr, metal::ElementType::Int32);
-    logits_ = allocate(runtime_, rows * plan_.vocabularySize);
+    logits_ = allocate(runtime_, rows * plan_.vocabularySize, nullptr,
+                       metal::ElementType::Float32);
     nextTokenIds_ =
         allocate(runtime_, rows, nullptr, metal::ElementType::Int32);
     blockTables_.reserve(plan_.layerCount);
@@ -226,83 +258,71 @@ private:
                                       metal::ElementType::Int32));
     }
 
-    auto weight = [&](const std::vector<float> &values) {
-      return allocate(runtime_, values.size(), values.data());
-    };
-    const auto embeddingWeight = weight(workload.embeddingWeight);
-    const auto finalNormWeight = weight(workload.finalNormWeight);
-    const auto languageModelHeadWeight =
-        weight(workload.languageModelHeadWeight);
-    const auto ropeCosine = weight(workload.ropeCosine);
-    const auto ropeSine = weight(workload.ropeSine);
-    std::vector<ServingLayerBuffers> layers;
-    layers.reserve(workload.layers.size());
-    for (const auto &parameters : workload.layers) {
-      layers.push_back({weight(parameters.inputNormWeight),
-                        weight(parameters.queryWeight),
-                        weight(parameters.keyWeight),
-                        weight(parameters.valueWeight),
-                        weight(parameters.outputWeight),
-                        weight(parameters.postAttentionNormWeight),
-                        weight(parameters.gateWeight),
-                        weight(parameters.upWeight),
-                        weight(parameters.downWeight)});
-    }
+    const auto &embeddingWeight = modelResources_->embeddingWeight;
+    const auto &finalNormWeight = modelResources_->finalNormWeight;
+    const auto &languageModelHeadWeight =
+        modelResources_->languageModelHeadWeight;
+    const auto &ropeCosine = modelResources_->ropeCosine;
+    const auto &ropeSine = modelResources_->ropeSine;
+    const auto &layers = modelResources_->layers;
 
     std::vector<std::unique_ptr<metal::PreparedExecution>> steps;
     auto intermediate = [&](std::size_t count) {
-      return allocate(runtime_, count);
+      return allocate(runtime_, count, nullptr, storageType_);
     };
     auto add = [&](const metal::GeneratedKernel &kernel,
                    const std::vector<Buffer> &inputs,
                    const std::vector<metal::ElementType> &inputTypes,
                    const Buffer &output,
-                   metal::ElementType outputType =
-                       metal::ElementType::Float32) {
+                   metal::ElementType outputType = metal::ElementType::Float32) {
       steps.push_back(prepare(runtime_, kernel, inputs, inputTypes, output,
                               outputType));
     };
     auto addLinear = [&](std::size_t inputSize, std::size_t outputSize,
                          const std::string &name, const Buffer &input,
                          const Buffer &matrix, const Buffer &output) {
+      const auto outputType = output->elementType();
       const metal::DecodeGEMVConfig configuration{
           128, inputSize % 4 == 0 ? std::size_t{4} : std::size_t{1}};
       add(metal::emitDecodeGEMV(rows, inputSize, outputSize, configuration,
-                                name),
+                                name, storageType_, outputType),
           {input, matrix},
-          {metal::ElementType::Float32, metal::ElementType::Float32},
-          output);
+          {storageType_, storageType_}, output, outputType);
     };
 
     auto current = intermediate(hiddenCount);
-    add(metal::emitDecoderEmbedding(plan_, 1, "serving_decode_embedding"),
+    auto nextLayerOutput = intermediate(hiddenCount);
+    std::vector<Buffer> hiddenScratch;
+    hiddenScratch.reserve(11);
+    for (std::size_t slot = 0; slot < 11; ++slot) {
+      hiddenScratch.push_back(intermediate(hiddenCount));
+    }
+    const auto gated = intermediate(intermediateCount);
+    add(metal::emitDecoderEmbedding(plan_, 1, "serving_decode_embedding",
+                                    storageType_),
         {tokenIds_, embeddingWeight},
-        {metal::ElementType::Int32, metal::ElementType::Float32}, current);
+        {metal::ElementType::Int32, storageType_}, current, storageType_);
 
     for (std::size_t index = 0; index < layers.size(); ++index) {
       const auto prefix = "serving_decode_l" + std::to_string(index) + "_";
       const auto &layer = layers[index];
-      auto inputNormalized = intermediate(hiddenCount);
-      auto query = intermediate(hiddenCount);
-      auto key = intermediate(hiddenCount);
-      auto value = intermediate(hiddenCount);
-      auto rotatedQuery = intermediate(hiddenCount);
-      auto rotatedKey = intermediate(hiddenCount);
-      auto context = intermediate(hiddenCount);
-      auto attentionOutput = intermediate(hiddenCount);
-      auto afterAttention = intermediate(hiddenCount);
-      auto postAttentionNormalized = intermediate(hiddenCount);
-      auto gate = intermediate(intermediateCount);
-      auto up = intermediate(intermediateCount);
-      auto gated = intermediate(intermediateCount);
-      auto mlpOutput = intermediate(hiddenCount);
-      auto layerOutput = intermediate(hiddenCount);
+      const auto &inputNormalized = hiddenScratch[0];
+      const auto &query = hiddenScratch[1];
+      const auto &key = hiddenScratch[2];
+      const auto &value = hiddenScratch[3];
+      const auto &rotatedQuery = hiddenScratch[4];
+      const auto &rotatedKey = hiddenScratch[5];
+      const auto &context = hiddenScratch[6];
+      const auto &attentionOutput = hiddenScratch[7];
+      const auto &afterAttention = hiddenScratch[8];
+      const auto &postAttentionNormalized = hiddenScratch[9];
+      const auto &mlpOutput = hiddenScratch[10];
+      const auto &layerOutput = nextLayerOutput;
 
       add(metal::emitDecoderRMSNorm(rows, hidden, plan_.rmsNormEpsilon,
-                                    threads, prefix + "input_norm"),
+                                    threads, prefix + "input_norm", storageType_),
           {current, layer.inputNormWeight},
-          {metal::ElementType::Float32, metal::ElementType::Float32},
-          inputNormalized);
+          {storageType_, storageType_}, inputNormalized, storageType_);
       addLinear(hidden, hidden, prefix + "query", inputNormalized,
                 layer.queryWeight, query);
       addLinear(hidden, hidden, prefix + "key", inputNormalized,
@@ -310,84 +330,77 @@ private:
       addLinear(hidden, hidden, prefix + "value", inputNormalized,
                 layer.valueWeight, value);
       add(metal::emitServingRoPE(plan_, maximumBatchSize_,
-                                 prefix + "query_rope"),
+                                 prefix + "query_rope", storageType_),
           {query, ropeCosine, ropeSine, validLengths_, activeCount_},
-          {metal::ElementType::Float32, metal::ElementType::Float32,
+          {storageType_, metal::ElementType::Float32,
            metal::ElementType::Float32, metal::ElementType::Int32,
            metal::ElementType::Int32},
-          rotatedQuery);
+          rotatedQuery, storageType_);
       add(metal::emitServingRoPE(plan_, maximumBatchSize_,
-                                 prefix + "key_rope"),
+                                 prefix + "key_rope", storageType_),
           {key, ropeCosine, ropeSine, validLengths_, activeCount_},
-          {metal::ElementType::Float32, metal::ElementType::Float32,
+          {storageType_, metal::ElementType::Float32,
            metal::ElementType::Float32, metal::ElementType::Int32,
            metal::ElementType::Int32},
-          rotatedKey);
+          rotatedKey, storageType_);
       add(metal::emitServingPagedCacheAppend(
               plan_, maximumBatchSize_, true, pageSize_,
-              prefix + "key_cache_append"),
+              prefix + "key_cache_append", storageType_),
           {rotatedKey, validLengths_, blockTables_[index], activeCount_},
-          {metal::ElementType::Float32, metal::ElementType::Int32,
+          {storageType_, metal::ElementType::Int32,
            metal::ElementType::Int32, metal::ElementType::Int32},
-          pools_[index]->keyBuffer());
+          pools_[index]->keyBuffer(), storageType_);
       add(metal::emitServingPagedCacheAppend(
               plan_, maximumBatchSize_, false, pageSize_,
-              prefix + "value_cache_append"),
+              prefix + "value_cache_append", storageType_),
           {value, validLengths_, blockTables_[index], activeCount_},
-          {metal::ElementType::Float32, metal::ElementType::Int32,
+          {storageType_, metal::ElementType::Int32,
            metal::ElementType::Int32, metal::ElementType::Int32},
-          pools_[index]->valueBuffer());
+          pools_[index]->valueBuffer(), storageType_);
       add(metal::emitServingPagedKVAttention(
               plan_.attention, maximumBatchSize_, pageSize_,
               prefix + "paged_attention"),
           {rotatedQuery, pools_[index]->keyBuffer(),
            pools_[index]->valueBuffer(), validLengths_, blockTables_[index],
            activeCount_},
-          {metal::ElementType::Float32, metal::ElementType::Float32,
-           metal::ElementType::Float32, metal::ElementType::Int32,
+          {storageType_, storageType_, storageType_, metal::ElementType::Int32,
            metal::ElementType::Int32, metal::ElementType::Int32},
-          context);
+          context, storageType_);
       addLinear(hidden, hidden, prefix + "attention_output", context,
                 layer.outputWeight, attentionOutput);
-      add(metal::emitDecoderAdd(hiddenCount, threads,
-                                prefix + "attention_residual"),
-          {current, attentionOutput},
-          {metal::ElementType::Float32, metal::ElementType::Float32},
-          afterAttention);
-      add(metal::emitDecoderRMSNorm(rows, hidden, plan_.rmsNormEpsilon,
-                                    threads,
-                                    prefix + "post_attention_norm"),
-          {afterAttention, layer.postAttentionNormWeight},
-          {metal::ElementType::Float32, metal::ElementType::Float32},
-          postAttentionNormalized);
-      addLinear(hidden, plan_.intermediateSize, prefix + "gate",
-                postAttentionNormalized, layer.gateWeight, gate);
-      addLinear(hidden, plan_.intermediateSize, prefix + "up",
-                postAttentionNormalized, layer.upWeight, up);
-      add(metal::emitDecoderSiLUMul(intermediateCount, threads,
-                                    prefix + "silu_mul"),
-          {gate, up},
-          {metal::ElementType::Float32, metal::ElementType::Float32}, gated);
+      const auto residualNorm = metal::emitDecoderResidualRMSNorm(
+          rows, hidden, plan_.rmsNormEpsilon, threads,
+          prefix + "residual_rmsnorm", storageType_);
+      steps.push_back(prepare(
+          runtime_, residualNorm,
+          {current, attentionOutput, layer.postAttentionNormWeight},
+          {storageType_, storageType_, storageType_},
+          {afterAttention, postAttentionNormalized},
+          {storageType_, storageType_}));
+      add(metal::emitDecoderGatedMLP(
+              rows, hidden, plan_.intermediateSize, threads,
+              prefix + "gated_mlp", storageType_),
+          {postAttentionNormalized, layer.gateWeight, layer.upWeight},
+          {storageType_, storageType_, storageType_}, gated, storageType_);
       addLinear(plan_.intermediateSize, hidden, prefix + "down", gated,
                 layer.downWeight, mlpOutput);
       add(metal::emitDecoderAdd(hiddenCount, threads,
-                                prefix + "mlp_residual"),
+                                prefix + "mlp_residual", storageType_),
           {afterAttention, mlpOutput},
-          {metal::ElementType::Float32, metal::ElementType::Float32},
-          layerOutput);
-      current = layerOutput;
+          {storageType_, storageType_}, layerOutput, storageType_);
+      std::swap(current, nextLayerOutput);
     }
 
-    auto normalized = intermediate(hiddenCount);
+    const auto &normalized = hiddenScratch[0];
     add(metal::emitDecoderRMSNorm(rows, hidden, plan_.rmsNormEpsilon, threads,
-                                  "serving_decode_final_norm"),
+                                  "serving_decode_final_norm", storageType_),
         {current, finalNormWeight},
-        {metal::ElementType::Float32, metal::ElementType::Float32},
-        normalized);
+        {storageType_, storageType_}, normalized, storageType_);
     addLinear(hidden, plan_.vocabularySize, "serving_decode_lm_head",
               normalized, languageModelHeadWeight, logits_);
     add(metal::emitTokenArgmax(rows, plan_.vocabularySize, threads,
-                               "serving_decode_argmax"),
+                               "serving_decode_argmax",
+                               metal::ElementType::Float32),
         {logits_}, {metal::ElementType::Float32}, nextTokenIds_,
         metal::ElementType::Int32);
     sequence_ = makeSequence(runtime_, steps);
@@ -398,7 +411,10 @@ private:
   std::vector<std::shared_ptr<KVPagePool>> pools_;
   std::size_t maximumBatchSize_ = 0;
   std::size_t pageSize_ = 0;
+  metal::ElementType storageType_ = metal::ElementType::Float32;
+  std::shared_ptr<DecoderLLMModelResources> modelResources_;
   std::size_t maximumPages_ = 0;
+  std::size_t activationStorageBytes_ = 0;
   Buffer tokenIds_;
   Buffer validLengths_;
   Buffer activeCount_;
@@ -506,18 +522,55 @@ ServingExecutionResult runContinuousBatch(
           "Serving configuration and requests must be nonempty.");
     }
     baseWorkload.plan.validate();
-    const auto pagesPerFullRequest =
-        pagesFor(baseWorkload.plan.attention.capacity, config.pageSize);
-    if (config.physicalPagesPerLayer < pagesPerFullRequest) {
+    DecoderLLMWorkload effectiveWorkload = baseWorkload;
+    const auto requestedDtype =
+        config.requestedStorageDtype.value_or(config.storageDtype);
+    DType effectiveDtype = config.storageDtype;
+    bool precisionFallback = requestedDtype != effectiveDtype;
+    if (effectiveDtype == DType::BFloat16 && !runtime.hardwareInfo().supportsBFloat16) {
+      if (!config.allowPrecisionFallback) {
+        throw std::invalid_argument(
+            "Serving bf16 storage is unavailable on this Metal backend; "
+            "enable allowPrecisionFallback to use fp16.");
+      }
+      effectiveDtype = DType::Float16;
+      precisionFallback = true;
+    }
+    if (effectiveDtype != DType::Float16 && effectiveDtype != DType::Float32 &&
+        effectiveDtype != DType::BFloat16) {
       throw std::invalid_argument(
-          "Shared KV pool must hold one request at full cache capacity.");
+          "Serving storage dtype must be fp32, fp16, or bf16.");
+    }
+    effectiveWorkload.plan.attention.dtype = effectiveDtype;
+    effectiveWorkload.plan.validate();
+    log << "Serving precision: requested=" << dtypeName(requestedDtype)
+        << ", effective=" << dtypeName(effectiveDtype)
+        << ", fallback=" << (precisionFallback ? "true" : "false") << '\n';
+    std::size_t largestRequestPages = 0;
+    for (const auto &spec : requestSpecs) {
+      if (spec.id.empty() || spec.promptTokenIds.size() < 2 ||
+          spec.promptTokenIds.size() >=
+              effectiveWorkload.plan.attention.capacity ||
+          spec.decodeTokenCount >
+              effectiveWorkload.plan.attention.capacity -
+                  spec.promptTokenIds.size()) {
+        throw std::invalid_argument("Serving request dimensions are invalid.");
+      }
+      largestRequestPages = std::max(
+          largestRequestPages,
+          pagesFor(spec.promptTokenIds.size() + spec.decodeTokenCount,
+                   config.pageSize));
+    }
+    if (config.physicalPagesPerLayer < largestRequestPages) {
+      throw std::invalid_argument(
+          "Shared KV pool cannot hold the largest configured request.");
     }
 
     std::vector<std::shared_ptr<KVPagePool>> pools;
-    pools.reserve(baseWorkload.plan.layerCount);
-    for (std::size_t layer = 0; layer < baseWorkload.plan.layerCount; ++layer) {
+    pools.reserve(effectiveWorkload.plan.layerCount);
+    for (std::size_t layer = 0; layer < effectiveWorkload.plan.layerCount; ++layer) {
       auto creation = createKVPagePool(
-          runtime, baseWorkload.plan.attention, config.pageSize,
+          runtime, effectiveWorkload.plan.attention, config.pageSize,
           config.physicalPagesPerLayer);
       if (!creation.pool) throw std::runtime_error(creation.errorMessage);
       pools.push_back(std::move(creation.pool));
@@ -525,17 +578,11 @@ ServingExecutionResult runContinuousBatch(
 
     std::vector<Request> requests;
     requests.reserve(requestSpecs.size());
+    std::shared_ptr<DecoderLLMModelResources> sharedModelResources;
     for (const auto &spec : requestSpecs) {
-      if (spec.id.empty() || spec.promptTokenIds.size() < 2 ||
-          spec.promptTokenIds.size() >= baseWorkload.plan.attention.capacity ||
-          spec.decodeTokenCount >
-              baseWorkload.plan.attention.capacity -
-                  spec.promptTokenIds.size()) {
-        throw std::invalid_argument("Serving request dimensions are invalid.");
-      }
       Request request;
       request.spec = spec;
-      request.workload = baseWorkload;
+      request.workload = effectiveWorkload;
       request.workload.plan.attention.prefillLength =
           spec.promptTokenIds.size();
       request.workload.decodeCount = spec.decodeTokenCount;
@@ -545,6 +592,10 @@ ServingExecutionResult runContinuousBatch(
       options.prefillChunkSize =
           std::min(config.prefillChunkSize, spec.promptTokenIds.size() - 1);
       options.sharedKVPools = pools;
+      options.storageDtype = effectiveDtype;
+      options.requestedStorageDtype = requestedDtype;
+      options.allowPrecisionFallback = false;
+      options.sharedModelResources = sharedModelResources;
       std::ostringstream compilationLog;
       auto compilation = compileDecoderLLM(runtime, request.workload,
                                            compilationLog, options);
@@ -554,6 +605,9 @@ ServingExecutionResult runContinuousBatch(
                                  compilation.errorMessage);
       }
       request.decoder = std::move(compilation.executable);
+      if (!sharedModelResources) {
+        sharedModelResources = request.decoder->sharedModelResources();
+      }
       request.output.id = spec.id;
       requests.push_back(std::move(request));
       log << "Serving request " << spec.id << ": compiled, prompt="
@@ -562,8 +616,20 @@ ServingExecutionResult runContinuousBatch(
           << '\n';
     }
 
-    BatchedDecodeExecutor batchedDecoder(runtime, baseWorkload, pools,
-                                         requestSpecs.size(), config.pageSize);
+    BatchedDecodeExecutor batchedDecoder(
+        runtime, effectiveWorkload, pools, requestSpecs.size(), config.pageSize,
+        sharedModelResources);
+    result.metrics.modelStorageBytes = sharedModelResources->storageBytes;
+    result.metrics.kvPoolStorageBytes =
+        effectiveWorkload.plan.layerCount * 2 *
+        config.physicalPagesPerLayer * config.pageSize *
+        effectiveWorkload.plan.hiddenSize() * dtypeStorageBytes(effectiveDtype);
+    for (const auto &request : requests) {
+      result.metrics.requestActivationStorageBytes +=
+          request.decoder->activationStorageBytes();
+    }
+    result.metrics.batchedActivationStorageBytes =
+        batchedDecoder.activationStorageBytes();
     log << "Shared batched decode pipeline: PASS, maximum_batch="
         << requestSpecs.size() << '\n';
 
@@ -715,11 +781,11 @@ ServingExecutionResult runContinuousBatch(
         std::vector<float> tokenIds;
         std::vector<float> validLengths;
         std::vector<std::vector<float>> blockTables(
-            baseWorkload.plan.layerCount);
+            effectiveWorkload.plan.layerCount);
         tokenIds.reserve(active.size());
         validLengths.reserve(active.size());
         const auto maximumPages =
-            pagesFor(baseWorkload.plan.attention.capacity, config.pageSize);
+            pagesFor(effectiveWorkload.plan.attention.capacity, config.pageSize);
         const auto packingStart = Clock::now();
         for (std::size_t row = 0; row < active.size(); ++row) {
           const auto index = active[row];
@@ -768,10 +834,10 @@ ServingExecutionResult runContinuousBatch(
           request.decoder->commitKVLength(previousLengths[row] + 1);
           const auto logitsBegin =
               decoded.logits.begin() + static_cast<std::ptrdiff_t>(
-                                           row * baseWorkload.plan.vocabularySize);
+              row * effectiveWorkload.plan.vocabularySize);
           const auto logitsEnd =
               logitsBegin + static_cast<std::ptrdiff_t>(
-                                baseWorkload.plan.vocabularySize);
+                                effectiveWorkload.plan.vocabularySize);
           request.output.decodeLogits.emplace_back(logitsBegin, logitsEnd);
           request.nextTokenIds = {decoded.nextTokenIds[row]};
           request.output.generatedTokenIds.push_back(
@@ -800,7 +866,7 @@ ServingExecutionResult runContinuousBatch(
       }
 
       std::string isolationError;
-      if (!auditPageIsolation(requests, baseWorkload.plan.layerCount,
+      if (!auditPageIsolation(requests, effectiveWorkload.plan.layerCount,
                               isolationError)) {
         throw std::runtime_error(isolationError);
       }

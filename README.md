@@ -62,6 +62,7 @@ AICompiler/
 │   ├── runtime/
 │   │   ├── GeneratedKernelAdmission.*
 │   │   ├── DecoderLLMExecutor.*
+│   │   ├── DecoderLLMModelResources.hpp
 │   │   ├── GraphExecutor.*
 │   │   ├── KVCacheState.*
 │   │   ├── KernelRegistry.*
@@ -238,15 +239,20 @@ This workload follows the current PyTorch model's sinusoidal positional encoding
 
 ### Decoder-only LLM and Decode GEMV
 
-- Adds a two-layer decoder-only PyTorch workload with pre-norm RMSNorm, interleaved RoPE, causal self-attention, SwiGLU, LM head, and autoregressive token feedback.
-- Imports fixed fp32 parameters and PyTorch references for an 8-token prefill followed by eight single-token decode steps.
+- Adds a configurable decoder-only PyTorch workload with pre-norm RMSNorm, interleaved RoPE, causal self-attention, SwiGLU, LM head, and autoregressive token feedback.
+- Imports generated parameters or a local Llama-compatible checkpoint together with PyTorch logits, token, and KV-cache references.
 - Keeps one fixed-capacity K/V cache per layer and compiles reusable prefill and decode Metal command sequences.
-- Autotunes Decode GEMV candidates for each Linear shape and admits candidates only after hardware, interface, numerical, warmup, and paired performance checks; prefill uses the generic Linear kernel.
+- Autotunes scalar/vector/SIMD-group Decode GEMV and tiled prefill GEMM candidates for each Linear shape, with fp32 accumulation and complete local admission.
 - Validates logits, generated tokens, every logical cache prefix, cache length, and cache storage reuse.
 
 ```bash
 ./run.sh decoder-llm
 ```
+
+Set `TMC_DECODER_DTYPE` to `fp32`, `fp16`, or `bf16`. Model dimensions can be
+set through the `TMC_DECODER_*` variables in `run.sh`; set
+`TMC_DECODER_CHECKPOINT` to a local checkpoint file or directory. Native bf16
+uses Metal 3.1 on supported Apple GPUs and safely resolves to fp16 otherwise.
 
 ### Admitted kernels in decoder execution
 
@@ -270,13 +276,16 @@ Generation uses the same remote Workflow for all six patterns. Decoder execution
 ### Benchmark and ablation
 
 - Uses two warmup runs and ten measured runs, with alternating template/generated order for the Metal decoder comparison.
-- Reports prefill and decode p50/p90, GPU command time, CPU submit-to-completion time, end-to-end time, tokens/s, and fixed KV storage.
+- Reports TTFT, TPOT, prefill/decode p50/p90, GPU command time, CPU submit-to-completion time, end-to-end time, tokens/s, and planned model/KV/activation memory.
 - Compares template-only and generated-enabled decoder plans and prints a measured-only runtime usage audit.
-- Runs the PyTorch reference on MPS with synchronized timing over the same logits/token readback and autoregressive token-feedback scope; Metal GPU timestamps and MPS synchronized wall timing are reported separately.
+- Runs the PyTorch reference on MPS with synchronized timing over the same logits/token readback and autoregressive token-feedback scope, including sampled peak MPS allocation.
+- Measures generated-kernel off/on and fusion off/on separately. The precision benchmark runs fp32, fp16, and bf16 (with reported effective fallback) through both MPS and Metal.
 - Advisor ablation benchmarks deterministic exhaustive search and LLM-guided Top-K plans. The regression command covers local compiler/runtime paths without contacting either remote Workflow.
 
 ```bash
 ./run.sh benchmark
+./run.sh benchmark-precision
+./run.sh precision
 ./run.sh ablation
 ./run.sh regression
 ```
@@ -303,6 +312,7 @@ This stage intentionally covers one request. Continuous batching, preemption, an
 - Audits physical-page isolation, requires an exercised preemption/resume path, and verifies that all page allocations are released.
 - Compares every request's prefill logits, decode logits, and generated token chain with independent sequential Paged KV + Chunked Prefill execution.
 - Reports separate prefill, batched decode, scheduler, KV-management, and spill/restore timings together with decoded-token and Metal-submission counts.
+- Reports shared model, KV page-pool, per-request activation, batched activation, and planned peak memory.
 
 ```bash
 ./run.sh serving

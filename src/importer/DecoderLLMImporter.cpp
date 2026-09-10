@@ -41,6 +41,13 @@ float readFloat(std::istream &input, const char *description) {
   return value;
 }
 
+DType parseDType(const std::string &token) {
+  if (token == "F16") return DType::Float16;
+  if (token == "F32") return DType::Float32;
+  if (token == "BF16") return DType::BFloat16;
+  throw std::runtime_error("Unsupported decoder-only dtype '" + token + "'.");
+}
+
 std::string readQuoted(std::istream &input, const char *description) {
   std::string value;
   if (!(input >> std::quoted(value))) {
@@ -153,7 +160,8 @@ DecoderLLMImportResult importDecoderLLMWorkload(const std::string &manifestPath)
     }
     std::string magic;
     std::size_t version = 0;
-    if (!(input >> magic >> version) || magic != "TMC_DECODER_LLM" || version != 1) {
+    if (!(input >> magic >> version) || magic != "TMC_DECODER_LLM" ||
+        (version != 1 && version != 2)) {
       throw std::runtime_error("Invalid or unsupported decoder-only manifest header.");
     }
 
@@ -178,15 +186,51 @@ DecoderLLMImportResult importDecoderLLMWorkload(const std::string &manifestPath)
     plan.attention.prefillLength = readSize(input, "prefill length");
     workload->decodeCount = readSize(input, "decode step count");
     plan.rmsNormEpsilon = readFloat(input, "RMSNorm epsilon");
-    plan.attention.dtype = DType::Float32;
+    // The DTYPE marker was added after the original manifest format.  Keep
+    // accepting the old `TENSORS` marker so existing generated manifests stay
+    // usable, while making the requested storage precision explicit for new
+    // exports.
+    std::string marker;
+    if (!(input >> marker)) {
+      throw std::runtime_error("Missing decoder-only tensor section.");
+    }
+    if (marker == "DTYPE") {
+      std::string requestedToken;
+      if (!(input >> requestedToken)) {
+        throw std::runtime_error("Missing decoder-only dtype value.");
+      }
+      workload->requestedStorageDtype = parseDType(requestedToken);
+      if (version == 2) {
+        std::string effectiveToken;
+        if (!(input >> effectiveToken)) {
+          throw std::runtime_error("Missing effective decoder-only dtype value.");
+        }
+        plan.attention.dtype = parseDType(effectiveToken);
+      } else {
+        plan.attention.dtype = workload->requestedStorageDtype;
+      }
+      marker.clear();
+      if (!(input >> marker)) {
+        throw std::runtime_error("Missing decoder-only tensor section.");
+      }
+    } else {
+      plan.attention.dtype = DType::Float32;
+      workload->requestedStorageDtype = DType::Float32;
+    }
     plan.attention.threadsPerThreadgroup = 128;
+    while (plan.attention.threadsPerThreadgroup < plan.attention.headDimension &&
+           plan.attention.threadsPerThreadgroup < 1024) {
+      plan.attention.threadsPerThreadgroup *= 2;
+    }
     plan.validate();
     if (workload->decodeCount >
         plan.attention.capacity - plan.attention.prefillLength) {
       throw std::runtime_error("Decoder decode steps exceed cache capacity.");
     }
 
-    expect(input, "TENSORS");
+    if (marker != "TENSORS") {
+      throw std::runtime_error("Expected 'TENSORS' in decoder-only manifest.");
+    }
     const auto tensorCount = readSize(input, "named tensor count");
     std::unordered_map<std::string, TensorRange> ranges;
     for (std::size_t index = 0; index < tensorCount; ++index) {

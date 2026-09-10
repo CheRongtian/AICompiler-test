@@ -21,6 +21,7 @@ struct DecodeGEMVSelection {
 [[nodiscard]] DecodeGEMVSelection tuneDecodeGEMV(
     metal::MetalRuntime &runtime, std::size_t batch, std::size_t inputSize,
     std::size_t outputSize, const std::vector<float> &input,
-    const std::vector<float> &weight, std::ostream &log);
+    const std::vector<float> &weight, std::ostream &log,
+    DType storageDtype = DType::Float32, bool prefill = false);
 
 } // namespace tensor::planner

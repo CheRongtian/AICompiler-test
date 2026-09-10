@@ -21,6 +21,13 @@ using Clock = std::chrono::steady_clock;
 constexpr double kAbsoluteTolerance = 1e-3;
 constexpr double kRelativeTolerance = 5e-3;
 
+std::pair<double, double> tolerances(tensor::DType dtype) {
+  if (dtype == tensor::DType::Float16 || dtype == tensor::DType::BFloat16) {
+    return {2e-2, 2e-2};
+  }
+  return {kAbsoluteTolerance, kRelativeTolerance};
+}
+
 const char *passFail(bool passed) { return passed ? "PASS" : "FAIL"; }
 
 double elapsedUs(Clock::time_point start, Clock::time_point end) {
@@ -71,6 +78,8 @@ SequentialReference runSequentialReference(
       std::unique_ptr<tensor::runtime::CompiledDecoderLLM> decoder;
     };
     std::vector<CompiledRequest> compiledRequests;
+    std::shared_ptr<tensor::runtime::DecoderLLMModelResources>
+        sharedModelResources;
     for (const auto &spec : specs) {
       auto workload = baseWorkload;
       workload.plan.attention.prefillLength = spec.promptTokenIds.size();
@@ -80,12 +89,19 @@ SequentialReference runSequentialReference(
       options.kvPageSize = config.pageSize;
       options.prefillChunkSize =
           std::min(config.prefillChunkSize, spec.promptTokenIds.size() - 1);
+      options.storageDtype = config.storageDtype;
+      options.requestedStorageDtype = config.requestedStorageDtype;
+      options.allowPrecisionFallback = config.allowPrecisionFallback;
+      options.sharedModelResources = sharedModelResources;
       auto compilation = tensor::runtime::compileDecoderLLM(
           runtime, workload, compilationLog, options);
       if (!compilation.executable) {
         throw std::runtime_error("Sequential request " + spec.id +
                                  " compilation failed: " +
                                  compilation.errorMessage);
+      }
+      if (!sharedModelResources) {
+        sharedModelResources = compilation.executable->sharedModelResources();
       }
       compiledRequests.push_back(
           {spec, std::move(compilation.executable)});
@@ -155,7 +171,8 @@ bool validateVector(const std::string &label,
 bool validateRequests(
     const std::vector<tensor::runtime::ServingRequestOutput> &actual,
     const std::vector<tensor::runtime::ServingRequestOutput> &expected,
-    std::ostream &log) {
+    std::ostream &log, double absoluteTolerance,
+    double relativeTolerance) {
   if (actual.size() != expected.size()) {
     log << "Multi-request result count: FAIL\n";
     return false;
@@ -165,7 +182,8 @@ bool validateRequests(
     bool requestPassed = actual[request].id == expected[request].id;
     requestPassed &= validateVector(
         "  " + actual[request].id + " prefill logits",
-        actual[request].prefillLogits, expected[request].prefillLogits, log);
+        actual[request].prefillLogits, expected[request].prefillLogits, log,
+        absoluteTolerance, relativeTolerance);
     if (actual[request].decodeLogits.size() !=
         expected[request].decodeLogits.size()) {
       requestPassed = false;
@@ -177,7 +195,8 @@ bool validateRequests(
             "  " + actual[request].id + " decode " +
                 std::to_string(step) + " logits",
             actual[request].decodeLogits[step],
-            expected[request].decodeLogits[step], log);
+            expected[request].decodeLogits[step], log, absoluteTolerance,
+            relativeTolerance);
       }
     }
     requestPassed &= validateVector(
@@ -219,6 +238,17 @@ bool runServingWorkload(tensor::metal::MetalRuntime &runtime,
   config.physicalPagesPerLayer = 8;
   config.prefillChunkSize = 3;
   config.kernelLibrary = kernelLibrary;
+  config.storageDtype = imported.workload->plan.attention.dtype;
+  config.requestedStorageDtype = imported.workload->requestedStorageDtype;
+  config.allowPrecisionFallback = true;
+  const auto effectiveDtype = config.storageDtype == tensor::DType::BFloat16 &&
+                                  !runtime.hardwareInfo().supportsBFloat16
+                                  ? tensor::DType::Float16
+                                  : config.storageDtype;
+  const auto [absoluteTolerance, relativeTolerance] = tolerances(effectiveDtype);
+  log << "Serving requested storage: "
+      << tensor::dtypeName(config.requestedStorageDtype.value_or(
+             config.storageDtype)) << '\n';
 
   const auto sequential =
       runSequentialReference(runtime, *imported.workload, requests, config);
@@ -239,7 +269,8 @@ bool runServingWorkload(tensor::metal::MetalRuntime &runtime,
     return false;
   }
 
-  bool passed = validateRequests(serving.requests, sequential.requests, log);
+  bool passed = validateRequests(serving.requests, sequential.requests, log,
+                                 absoluteTolerance, relativeTolerance);
   const auto &metrics = serving.metrics;
   const bool schedulerPassed = metrics.maximumActiveBatchSize >= 2;
   const bool preemptionPassed = metrics.preemptionCount > 0 &&
@@ -282,6 +313,17 @@ bool runServingWorkload(tensor::metal::MetalRuntime &runtime,
       << ", KV management overhead(us): "
       << metrics.kvManagementOverheadUs
       << ", preemption overhead(us): " << metrics.preemptionOverheadUs
+      << '\n'
+      << "Serving memory(bytes): model=" << metrics.modelStorageBytes
+      << ", KV_pool=" << metrics.kvPoolStorageBytes
+      << ", request_activations="
+      << metrics.requestActivationStorageBytes
+      << ", batched_activations="
+      << metrics.batchedActivationStorageBytes
+      << ", planned_peak_total="
+      << metrics.modelStorageBytes + metrics.kvPoolStorageBytes +
+             metrics.requestActivationStorageBytes +
+             metrics.batchedActivationStorageBytes
       << '\n';
   passed &= schedulerPassed && preemptionPassed && poolPassed && batchingPassed;
   log << "Continuous batching + preemption validation: " << passFail(passed)

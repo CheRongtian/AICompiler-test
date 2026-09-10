@@ -7,12 +7,20 @@
 #include <algorithm>
 #include <optional>
 #include <ostream>
+#include <utility>
 #include <vector>
 
 namespace {
 
 constexpr double kAbsoluteTolerance = 1e-3;
 constexpr double kRelativeTolerance = 5e-3;
+
+std::pair<double, double> tolerances(tensor::DType dtype) {
+  if (dtype == tensor::DType::Float16 || dtype == tensor::DType::BFloat16) {
+    return {2e-2, 2e-2};
+  }
+  return {kAbsoluteTolerance, kRelativeTolerance};
+}
 
 const char *passFail(bool passed) { return passed ? "PASS" : "FAIL"; }
 
@@ -36,15 +44,17 @@ std::optional<double> median(std::vector<double> values) {
 
 bool validateState(const tensor::runtime::CompiledDecoderLLM &decoder,
                    const tensor::DecoderLLMReference &reference,
-                   std::size_t expectedLength, std::ostream &log) {
+                   std::size_t expectedLength, std::ostream &log,
+                   double absoluteTolerance, double relativeTolerance) {
   bool passed = true;
   for (std::size_t layer = 0; layer < reference.keyCaches.size(); ++layer) {
     passed &= validate("  layer " + std::to_string(layer) + " key cache",
                        decoder.readKeyPrefix(layer), reference.keyCaches[layer],
-                       log);
+                       log, absoluteTolerance, relativeTolerance);
     passed &= validate("  layer " + std::to_string(layer) + " value cache",
                        decoder.readValuePrefix(layer),
-                       reference.valueCaches[layer], log);
+                       reference.valueCaches[layer], log, absoluteTolerance,
+                       relativeTolerance);
   }
   const bool lengthPassed = decoder.currentLength() == expectedLength;
   log << "  cache length: " << passFail(lengthPassed)
@@ -80,6 +90,9 @@ bool runDecoderLLMWorkload(tensor::metal::MetalRuntime &runtime,
 
   tensor::runtime::DecoderLLMCompileOptions options;
   options.kernelLibrary = kernelLibrary;
+  options.storageDtype = plan.attention.dtype;
+  options.requestedStorageDtype = workload.requestedStorageDtype;
+  options.allowPrecisionFallback = true;
   auto compilation =
       tensor::runtime::compileDecoderLLM(runtime, workload, log, options);
   if (!compilation.executable) {
@@ -88,6 +101,14 @@ bool runDecoderLLMWorkload(tensor::metal::MetalRuntime &runtime,
     return false;
   }
   auto &decoder = *compilation.executable;
+  const auto [absoluteTolerance, relativeTolerance] =
+      tolerances(decoder.storageDtype());
+  log << "Decoder storage: " << tensor::dtypeName(decoder.storageDtype())
+      << ", precision_fallback="
+      << (decoder.precisionFallbackUsed() ? "true" : "false")
+      << ", model_bytes=" << decoder.modelStorageBytes()
+      << ", kv_bytes=" << decoder.kvStorageBytes()
+      << ", activation_bytes=" << decoder.activationStorageBytes() << '\n';
   bool passed = true;
   std::vector<double> decodeTimes;
 
@@ -98,11 +119,13 @@ bool runDecoderLLMWorkload(tensor::metal::MetalRuntime &runtime,
     return false;
   }
   log << "Decoder prefill execution: PASS\n";
-  passed &= validate("  logits", prefill.logits, workload.prefill.logits, log);
+  passed &= validate("  logits", prefill.logits, workload.prefill.logits, log,
+                     absoluteTolerance, relativeTolerance);
   passed &= validate("  next token", prefill.nextTokenIds,
                      workload.prefill.nextTokenIds, log, 0.0, 0.0);
   passed &= validateState(decoder, workload.prefill,
-                          plan.attention.prefillLength, log);
+                          plan.attention.prefillLength, log, absoluteTolerance,
+                          relativeTolerance);
   if (prefill.gpuExecutionTimeUs) {
     log << "Decoder prefill GPU time (us): " << *prefill.gpuExecutionTimeUs
         << '\n';
@@ -123,11 +146,13 @@ bool runDecoderLLMWorkload(tensor::metal::MetalRuntime &runtime,
       return false;
     }
     bool stepPassed = chainPassed;
-    stepPassed &= validate("  logits", result.logits, reference.logits, log);
+    stepPassed &= validate("  logits", result.logits, reference.logits, log,
+                           absoluteTolerance, relativeTolerance);
     stepPassed &= validate("  next token", result.nextTokenIds,
                            reference.nextTokenIds, log, 0.0, 0.0);
     stepPassed &= validateState(
-        decoder, reference, plan.attention.prefillLength + step + 1, log);
+        decoder, reference, plan.attention.prefillLength + step + 1, log,
+        absoluteTolerance, relativeTolerance);
     log << "Decoder step " << step << ": " << passFail(stepPassed) << '\n';
     passed &= stepPassed;
     nextTokens = result.nextTokenIds;

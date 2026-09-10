@@ -117,6 +117,15 @@ bool runVectorAddCase(const tensor::metal::MetalRuntime &runtime,
 int main(int argc, char **argv) {
   try {
     tensor::metal::MetalRuntime runtime;
+    if (argc == 3 && std::string(argv[1]) == "--resolve-storage") {
+      if (!runtime.isAvailable()) throw std::runtime_error(runtime.initializationError());
+      const std::string requested = argv[2];
+      if (requested != "fp32" && requested != "fp16" && requested != "bf16")
+        throw std::invalid_argument("Expected fp32, fp16, or bf16 storage.");
+      std::cout << (requested == "bf16" && !runtime.hardwareInfo().supportsBFloat16
+                        ? "fp16" : requested) << '\n';
+      return 0;
+    }
     const std::string deviceName = runtime.deviceName();
     std::cout << "Metal device: "
               << (deviceName.empty() ? "Unavailable" : deviceName) << '\n';
@@ -180,11 +189,15 @@ int main(int argc, char **argv) {
         std::string(argv[3]) == "--kernel-library") {
       return runServingWorkload(runtime, argv[2], std::cout, argv[4]) ? 0 : 1;
     }
-    if (argc == 9 && std::string(argv[1]) == "--benchmark-decoder-llm" &&
+    if (argc == 9 && (std::string(argv[1]) == "--benchmark-decoder-llm" ||
+                     std::string(argv[1]) == "--benchmark-decoder-tokens" ||
+                     std::string(argv[1]) == "--benchmark-decoder-fusions") &&
         std::string(argv[3]) == "--kernel-library" &&
         std::string(argv[5]) == "--warmup" &&
         std::string(argv[7]) == "--samples") {
       DecoderBenchmarkOptions options;
+      options.tokenOnly=std::string(argv[1])=="--benchmark-decoder-tokens";
+      options.compareFusions=std::string(argv[1])=="--benchmark-decoder-fusions";
       options.kernelLibrary = argv[4];
       options.warmupRuns = parseCount(argv[6], "warmup runs");
       options.measuredRuns = parseCount(argv[8], "measured runs");
@@ -229,6 +242,10 @@ int main(int argc, char **argv) {
                    " --chunk-size <tokens> --kernel-library <directory>]"
                    " [--serving <decoder-manifest> --kernel-library <directory>]"
                    " [--benchmark-decoder-llm <decoder-manifest>"
+                   " --kernel-library <directory> --warmup <runs> --samples <runs>]"
+                   " [--benchmark-decoder-tokens <decoder-manifest>"
+                   " --kernel-library <directory> --warmup <runs> --samples <runs>]"
+                   " [--benchmark-decoder-fusions <decoder-manifest>"
                    " --kernel-library <directory> --warmup <runs> --samples <runs>]"
                    " [--emit-kernel-contract <json> [--pattern <pattern>]]"
                    " [--admit-generated-kernel <json> --feedback-output <json>"

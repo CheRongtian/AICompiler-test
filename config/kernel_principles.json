@@ -2,6 +2,7 @@
   "version": 2,
   "common": [
     "The immutable compiler contract controls semantics, buffer bindings, types, dispatch and legal workgroups.",
+    "Respect storage_dtype and every typed ABI binding: half, bfloat and float are distinct. Accumulate reductions in fp32. Round at the storage boundaries specified in semantics; RoPE constants stay fp32. Never reinterpret ushort as native bfloat arithmetic.",
     "Use valid Metal Shading Language. Never call get_thread_execution_width() or get_num_threads_per_grid(). Thread/group indices must use the parameters allowed by contract.dispatch.",
     "Host dispatch is fixed. Read whether one work item maps to a grid thread or a whole threadgroup. All group reduction barriers must be reached uniformly by the participating threads.",
     "Read previous_attempts and compiler_feedback from this request; remote conversation memory is unnecessary.",
@@ -22,18 +23,21 @@
     "decoder_gemv_64_64": [
       "Decode M=1: the weight matrix is contiguous row-major [N,K]. One threadgroup owns one output feature and reduces K input products.",
       "Use the declared group and tid attributes. Stride the K reduction by the selected workgroup_size (this is the group width, not SIMD width). Initialize inactive lanes to zero.",
+      "For a 32-thread workgroup, simd_sum is a legal optional reduction. For 64 or 128 threads, use the uniform threadgroup reduction and never assume a SIMD width.",
       "Use uniform threadgroup barriers for shared reductions; only a designated thread writes the completed output.",
       "The performance baseline includes scalar Linear and tuned vector-width 1/4 GEMV candidates. Preserve fp32 accumulation and numerical tolerance."
     ],
     "decoder_gemv_64_128": [
       "Decode M=1: the weight matrix is contiguous row-major [N,K]. One threadgroup owns one output feature and reduces K input products.",
       "Use the declared group and tid attributes. Stride the K reduction by the selected workgroup_size (this is the group width, not SIMD width). Initialize inactive lanes to zero.",
+      "For a 32-thread workgroup, simd_sum is a legal optional reduction. For 64 or 128 threads, use the uniform threadgroup reduction and never assume a SIMD width.",
       "Use uniform threadgroup barriers for shared reductions; only a designated thread writes the completed output.",
       "The performance baseline includes scalar Linear and tuned vector-width 1/4 GEMV candidates. Preserve fp32 accumulation and numerical tolerance."
     ],
     "decoder_gemv_128_64": [
       "Decode M=1: the weight matrix is contiguous row-major [N,K]. One threadgroup owns one output feature and reduces K input products.",
       "Use the declared group and tid attributes. Stride the K reduction by the selected workgroup_size (this is the group width, not SIMD width). Initialize inactive lanes to zero.",
+      "For a 32-thread workgroup, simd_sum is a legal optional reduction. For 64 or 128 threads, use the uniform threadgroup reduction and never assume a SIMD width.",
       "Use uniform threadgroup barriers for shared reductions; only a designated thread writes the completed output.",
       "The performance baseline includes scalar Linear and tuned vector-width 1/4 GEMV candidates. Preserve fp32 accumulation and numerical tolerance."
     ],

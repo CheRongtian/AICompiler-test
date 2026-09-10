@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <iosfwd>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,9 @@ struct ServingConfig {
   std::size_t physicalPagesPerLayer = 8;
   std::size_t prefillChunkSize = 3;
   std::string kernelLibrary;
+  DType storageDtype = DType::Float32;
+  std::optional<DType> requestedStorageDtype;
+  bool allowPrecisionFallback = false;
 };
 
 struct ServingRequestOutput {
@@ -52,6 +56,10 @@ struct ServingMetrics {
   std::size_t pageReleaseCount = 0;
   std::size_t decodeCommandSubmissions = 0;
   std::size_t decodedTokens = 0;
+  std::size_t modelStorageBytes = 0;
+  std::size_t kvPoolStorageBytes = 0;
+  std::size_t requestActivationStorageBytes = 0;
+  std::size_t batchedActivationStorageBytes = 0;
 };
 
 struct ServingExecutionResult {

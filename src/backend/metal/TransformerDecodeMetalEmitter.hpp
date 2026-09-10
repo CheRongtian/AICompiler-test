@@ -1,6 +1,7 @@
 #pragma once
 
 #include "backend/metal/MetalEmitter.hpp"
+#include "backend/metal/MetalRuntime.hpp"
 #include "planner/TransformerDecodePlan.hpp"
 
 #include <cstddef>
@@ -27,6 +28,7 @@ namespace tensor::metal {
 
 [[nodiscard]] GeneratedKernel emitTokenArgmax(
     std::size_t rows, std::size_t vocabularySize,
-    std::size_t threadsPerThreadgroup, const std::string &functionName);
+    std::size_t threadsPerThreadgroup, const std::string &functionName,
+    ElementType storageType = ElementType::Float32);
 
 } // namespace tensor::metal

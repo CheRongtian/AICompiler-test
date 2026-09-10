@@ -3,6 +3,8 @@
 #import <Foundation/Foundation.h>
 
 #include <filesystem>
+#include <algorithm>
+#include <exception>
 #include <ostream>
 #include <utility>
 
@@ -15,9 +17,6 @@ NSString *ns(const std::string &s) {
 std::string str(NSString *s) {
   return s.UTF8String ? std::string(s.UTF8String) : std::string{};
 }
-const std::vector<std::string> patterns{
-    "decoder_gemv_64_64", "decoder_gemv_64_128", "decoder_gemv_128_64",
-    "decoder_rope", "decoder_residual_rmsnorm", "decoder_gated_mlp"};
 }
 
 std::string writeAdmittedKernel(
@@ -48,7 +47,16 @@ void KernelRegistry::load(const metal::MetalRuntime &runtime,
     log << "Kernel registry: template-only (no library supplied)\n";
     return;
   }
-  for (const auto &pattern : patterns) {
+  if (!std::filesystem::is_directory(directory)) {
+    log << "Kernel registry: no library directory; template\n";
+    return;
+  }
+  std::vector<std::string> availablePatterns;
+  for(const auto &entry:std::filesystem::directory_iterator(directory))
+    if(entry.is_directory() && entry.path().filename().string().rfind("decoder_",0)==0)
+      availablePatterns.push_back(entry.path().filename().string());
+  std::sort(availablePatterns.begin(),availablePatterns.end());
+  for (const auto &pattern : availablePatterns) {
     const auto path = std::filesystem::path(directory) / pattern / "admitted.json";
     if (!std::filesystem::exists(path)) {
       log << "Kernel registry " << pattern << ": no admitted artifact; template\n";
@@ -63,7 +71,14 @@ void KernelRegistry::load(const metal::MetalRuntime &runtime,
         continue;
       }
       NSDictionary *record = decoded;
-      const auto contract = llm::makeKernelContract(pattern);
+      llm::KernelContract contract;
+      try { contract=llm::makeKernelContract(pattern); }
+      catch(const std::exception &exception) {
+        log << "Kernel registry " << pattern << ": " << exception.what() << "; template\n";
+        continue;
+      }
+      if(contract.storageType==metal::ElementType::BFloat16 &&
+         !runtime.hardwareInfo().supportsBFloat16) continue;
       if (![record[@"version"] isEqual:@1] ||
           ![record[@"status"] isEqual:@"admitted"] ||
           ![record[@"contract"] isEqual:ns(llm::serializeKernelContract(runtime, contract))] ||

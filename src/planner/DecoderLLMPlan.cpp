@@ -48,6 +48,10 @@ void DecoderLLMPlan::validate() const {
   if (!std::isfinite(rmsNormEpsilon) || rmsNormEpsilon <= 0.0f) {
     throw std::invalid_argument("Decoder-only RMSNorm epsilon must be positive.");
   }
+  if (accumulationDtype != DType::Float32) {
+    throw std::invalid_argument(
+        "Decoder-only reductions currently require fp32 accumulation.");
+  }
   (void)checkedMultiply(vocabularySize, hiddenSize());
   (void)checkedMultiply(intermediateSize, hiddenSize());
   (void)logitsElementCount(attention.prefillLength);

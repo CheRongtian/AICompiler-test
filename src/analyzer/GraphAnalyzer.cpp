@@ -11,7 +11,8 @@ namespace tensor::analyzer {
 namespace {
 
 bool isFloat(DType dtype) {
-  return dtype == DType::Float16 || dtype == DType::Float32;
+  return dtype == DType::Float16 || dtype == DType::Float32 ||
+         dtype == DType::BFloat16;
 }
 
 void validateType(const TensorType &type) {

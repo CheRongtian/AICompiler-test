@@ -15,6 +15,7 @@ namespace {
 const char *typeName(DType type) {
   if (type == DType::Float16) return "half";
   if (type == DType::Float32) return "float";
+  if (type == DType::BFloat16) return "ushort";
   throw std::invalid_argument("Fusion supports floating tensors only.");
 }
 
@@ -87,6 +88,14 @@ GeneratedKernel emitFusion(const analyzer::Region &region,
   GeneratedKernel kernel;
   kernel.threadsPerThreadgroup = threads;
   const auto &outputType = graph.types[region.outputs.front()];
+  if (outputType.dtype == DType::BFloat16 ||
+      std::any_of(region.inputs.begin(), region.inputs.end(),
+                  [&](ValueId input) {
+                    return graph.types[input].dtype == DType::BFloat16;
+                  })) {
+    throw std::invalid_argument(
+        "Generic Metal fusion does not support bf16 arithmetic.");
+  }
   const auto elementType = typeName(outputType.dtype);
   std::ostringstream source;
   source.imbue(std::locale::classic());

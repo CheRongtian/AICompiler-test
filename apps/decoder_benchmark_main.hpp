@@ -10,6 +10,8 @@ struct DecoderBenchmarkOptions {
   std::string kernelLibrary;
   std::size_t warmupRuns = 2;
   std::size_t measuredRuns = 10;
+  bool tokenOnly = false;
+  bool compareFusions = false;
 };
 
 [[nodiscard]] bool runDecoderLLMBenchmark(

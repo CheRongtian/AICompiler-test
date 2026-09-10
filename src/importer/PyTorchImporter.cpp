@@ -62,6 +62,7 @@ std::vector<std::size_t> readShape(std::istream &input) {
 DType parseDType(const std::string &token) {
   if (token == "F16") return DType::Float16;
   if (token == "F32") return DType::Float32;
+  if (token == "BF16") return DType::BFloat16;
   if (token == "I32") return DType::Int32;
   throw std::runtime_error("Unsupported dtype '" + token + "' in graph manifest.");
 }

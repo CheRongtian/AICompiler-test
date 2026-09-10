@@ -23,10 +23,27 @@ std::vector<std::size_t> contiguousStrides(const std::vector<std::size_t> &shape
 }
 
 bool isFloat(DType dtype) {
-  return dtype == DType::Float16 || dtype == DType::Float32;
+  return dtype == DType::Float16 || dtype == DType::Float32 ||
+         dtype == DType::BFloat16;
 }
 
 } // namespace
+
+const char *dtypeName(DType dtype) {
+  switch (dtype) {
+  case DType::Float16: return "fp16";
+  case DType::Float32: return "fp32";
+  case DType::BFloat16: return "bf16";
+  case DType::Int32: return "int32";
+  }
+  return "unknown";
+}
+
+bool isFloatingDType(DType dtype) { return isFloat(dtype); }
+
+std::size_t dtypeStorageBytes(DType dtype) {
+  return dtype == DType::Float16 || dtype == DType::BFloat16 ? 2u : 4u;
+}
 
 std::size_t TensorType::elementCount() const {
   std::size_t count = 1;
@@ -80,7 +97,7 @@ void RMSNormOp::validate() const {
   (void)weight.storageElementCount();
   (void)output.storageElementCount();
   if (!isFloat(input.dtype) || weight.dtype != input.dtype || output.dtype != input.dtype) {
-    throw std::invalid_argument("RMSNorm requires matching fp16 or fp32 tensors.");
+    throw std::invalid_argument("RMSNorm requires matching floating-point tensors.");
   }
   if (!input.isContiguous() || !weight.isContiguous() || !output.isContiguous()) {
     throw std::invalid_argument("RMSNorm requires contiguous tensors.");

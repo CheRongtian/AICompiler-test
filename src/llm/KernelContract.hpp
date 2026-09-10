@@ -23,6 +23,7 @@ struct KernelContract {
   std::vector<std::string> inputNames;
   std::vector<std::string> outputNames;
   std::vector<metal::ElementType> inputTypes;
+  metal::ElementType storageType = metal::ElementType::Float32;
   // Group dispatch allows a cooperative reduction per work item.
   bool groupPerWorkItem = false;
   std::string workItem = "element";
@@ -55,6 +56,8 @@ struct KernelBaseline {
 [[nodiscard]] std::string serializeKernelContract(
     const metal::MetalRuntime &runtime, const KernelContract &contract);
 [[nodiscard]] KernelContract makeKernelContract(const std::string &pattern);
+[[nodiscard]] std::string typedKernelPattern(const std::string &pattern,
+                                            metal::ElementType storageType);
 [[nodiscard]] metal::GeneratedKernel emitContractBaseline(
     const KernelContract &contract, const KernelCase &data, std::size_t threads);
 [[nodiscard]] std::string writeKernelContract(

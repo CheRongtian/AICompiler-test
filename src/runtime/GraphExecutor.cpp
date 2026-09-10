@@ -23,6 +23,7 @@ constexpr double kMinimumSpeedup = 1.05;
 
 metal::ElementType elementType(DType dtype) {
   if (dtype == DType::Float16) return metal::ElementType::Float16;
+  if (dtype == DType::BFloat16) return metal::ElementType::BFloat16;
   if (dtype == DType::Int32) return metal::ElementType::Int32;
   return metal::ElementType::Float32;
 }
@@ -348,7 +349,17 @@ GraphCompilation compileGraph(metal::MetalRuntime &runtime, const TensorGraph &g
   GraphCompilation result;
   try {
     if (!runtime.isAvailable()) throw std::runtime_error(runtime.initializationError());
-    auto program = planner::planRegions(planner::planGraph(analyzer::analyze(graph)));
+    auto analyzed = analyzer::analyze(graph);
+    if (std::any_of(analyzed.types.begin(), analyzed.types.end(),
+                    [](const TensorType &type) {
+                      return type.dtype == DType::BFloat16;
+                    })) {
+      throw std::invalid_argument(
+          "Generic TensorGraph bf16 kernels are unavailable on this Metal "
+          "backend; decoder workloads can request bf16 with fp16 fallback.");
+    }
+    auto program =
+        planner::planRegions(planner::planGraph(std::move(analyzed)));
     log << "Graph analysis: PASS, nodes=" << graph.nodes.size()
         << ", regions=" << program.regions.size() << '\n';
     const auto reference = validation::evaluateGraph(program.graph.analyzed, inputs);

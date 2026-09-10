@@ -14,9 +14,61 @@ KV_MANIFEST="$BUILD_DIR/kv_cache.tmc"
 REQUEST="$BUILD_DIR/advisor_request.json"
 RESPONSE="$BUILD_DIR/advisor_response.json"
 COMPILER="$BUILD_DIR/TensorMetalCompiler"
+DECODER_DTYPE="${TMC_DECODER_DTYPE:-fp32}"
+DECODER_CHECKPOINT="${TMC_DECODER_CHECKPOINT:-}"
+DECODER_SEED="${TMC_DECODER_SEED:-11}"
 
-if [[ "$MODE" != "advisor" && "$MODE" != "generate" && "$MODE" != "decode" && "$MODE" != "decoder-llm" && "$MODE" != "paged-kv" && "$MODE" != "serving" && "$MODE" != "benchmark" && "$MODE" != "ablation" && "$MODE" != "regression" ]]; then
-  echo "Usage: ./run.sh [advisor|generate [pattern|decoder-all]|decode|decoder-llm|paged-kv|serving|benchmark|ablation|regression]" >&2
+DECODER_ARGS=(--seed "$DECODER_SEED")
+[[ -n "$DECODER_CHECKPOINT" ]] && DECODER_ARGS+=(--checkpoint "$DECODER_CHECKPOINT")
+[[ -n "${TMC_DECODER_HIDDEN_SIZE:-}" ]] && DECODER_ARGS+=(--hidden-size "$TMC_DECODER_HIDDEN_SIZE")
+[[ -n "${TMC_DECODER_HEADS:-}" ]] && DECODER_ARGS+=(--heads "$TMC_DECODER_HEADS")
+[[ -n "${TMC_DECODER_LAYERS:-}" ]] && DECODER_ARGS+=(--layers "$TMC_DECODER_LAYERS")
+[[ -n "${TMC_DECODER_INTERMEDIATE_SIZE:-}" ]] && DECODER_ARGS+=(--intermediate-size "$TMC_DECODER_INTERMEDIATE_SIZE")
+[[ -n "${TMC_DECODER_VOCAB_SIZE:-}" ]] && DECODER_ARGS+=(--vocab-size "$TMC_DECODER_VOCAB_SIZE")
+[[ -n "${TMC_DECODER_CAPACITY:-}" ]] && DECODER_ARGS+=(--capacity "$TMC_DECODER_CAPACITY")
+[[ -n "${TMC_DECODER_PREFILL_LENGTH:-}" ]] && DECODER_ARGS+=(--prefill-length "$TMC_DECODER_PREFILL_LENGTH")
+[[ -n "${TMC_DECODER_DECODE_COUNT:-}" ]] && DECODER_ARGS+=(--decode-count "$TMC_DECODER_DECODE_COUNT")
+[[ -n "${TMC_DECODER_EPSILON:-}" ]] && DECODER_ARGS+=(--epsilon "$TMC_DECODER_EPSILON")
+
+export_decoder_llm() {
+  local requested_dtype="${1:-$DECODER_DTYPE}"
+  local effective_dtype
+  effective_dtype="$("$COMPILER" --resolve-storage "$requested_dtype")"
+  "$PYTHON" "$ROOT/tools/export_decoder_llm.py" \
+    --output "$DECODER_LLM_MANIFEST" \
+    --dtype "$requested_dtype" \
+    --effective-dtype "$effective_dtype" \
+    "${DECODER_ARGS[@]}"
+}
+
+benchmark_decoder_pair() {
+  local requested_dtype="${1:-$DECODER_DTYPE}"
+  local effective_dtype
+  export_decoder_llm "$requested_dtype"
+  effective_dtype="$("$COMPILER" --resolve-storage "$requested_dtype")"
+
+  "$PYTHON" "$ROOT/tools/benchmark_decoder_mps.py" \
+    --warmup 2 --samples 10 \
+    --dtype "$requested_dtype" \
+    --effective-dtype "$effective_dtype" \
+    "${DECODER_ARGS[@]}"
+
+  "$COMPILER" --benchmark-decoder-llm "$DECODER_LLM_MANIFEST" \
+    --kernel-library "$BUILD_DIR/generated_kernels" \
+    --warmup 2 --samples 10
+
+  "$PYTHON" "$ROOT/tools/benchmark_decoder_mps.py" \
+    --warmup 2 --samples 10 --token-only \
+    --dtype "$requested_dtype" \
+    --effective-dtype "$effective_dtype" \
+    "${DECODER_ARGS[@]}"
+  "$COMPILER" --benchmark-decoder-tokens "$DECODER_LLM_MANIFEST" \
+    --kernel-library "$BUILD_DIR/generated_kernels" \
+    --warmup 2 --samples 10
+}
+
+if [[ "$MODE" != "advisor" && "$MODE" != "generate" && "$MODE" != "decode" && "$MODE" != "decoder-llm" && "$MODE" != "paged-kv" && "$MODE" != "serving" && "$MODE" != "benchmark" && "$MODE" != "benchmark-precision" && "$MODE" != "precision" && "$MODE" != "ablation" && "$MODE" != "regression" ]]; then
+  echo "Usage: ./run.sh [advisor|generate [pattern|decoder-all|decoder-model]|decode|decoder-llm|paged-kv|serving|benchmark|benchmark-precision|precision|ablation|regression]" >&2
   exit 1
 fi
 
@@ -75,6 +127,35 @@ case "$MODE" in
     if [[ "$PATTERN" == "decoder-all" ]]; then
       patterns=(decoder_gemv_64_64 decoder_gemv_64_128 decoder_gemv_128_64
                 decoder_rope decoder_residual_rmsnorm decoder_gated_mlp)
+    elif [[ "$PATTERN" == "decoder-model" ]]; then
+      model_hidden="${TMC_DECODER_HIDDEN_SIZE:-64}"
+      model_intermediate="${TMC_DECODER_INTERMEDIATE_SIZE:-128}"
+      model_vocab="${TMC_DECODER_VOCAB_SIZE:-128}"
+      effective_dtype="$("$COMPILER" --resolve-storage "$DECODER_DTYPE")"
+      dtype_suffix=""
+      [[ "$effective_dtype" == "fp16" ]] && dtype_suffix="_fp16"
+      [[ "$effective_dtype" == "bf16" ]] && dtype_suffix="_bf16"
+      patterns=()
+      matrix_shapes=("$model_hidden $model_hidden"
+                     "$model_hidden $model_intermediate"
+                     "$model_intermediate $model_hidden"
+                     "$model_hidden $model_vocab")
+      for matrix_shape in "${matrix_shapes[@]}"; do
+        read -r input_size output_size <<< "$matrix_shape"
+        candidate="decoder_gemv_${input_size}_${output_size}${dtype_suffix}"
+        if (( input_size * output_size > 8388608 )); then
+          echo "Generated contract skipped: $candidate exceeds the 8M-element fixture limit."
+          continue
+        fi
+        if [[ " ${patterns[*]} " != *" $candidate "* ]]; then
+          patterns+=("$candidate")
+        fi
+      done
+      if [[ "$model_hidden" == "64" && "$model_intermediate" == "128" ]]; then
+        patterns+=("decoder_rope${dtype_suffix}"
+                   "decoder_residual_rmsnorm${dtype_suffix}"
+                   "decoder_gated_mlp${dtype_suffix}")
+      fi
     else
       patterns=("$PATTERN")
     fi
@@ -92,15 +173,13 @@ case "$MODE" in
     "$COMPILER" --transformer-decode "$DECODE_MANIFEST"
     ;;
   decoder-llm)
-    "$PYTHON" "$ROOT/tools/export_decoder_llm.py" \
-      --output "$DECODER_LLM_MANIFEST"
+    export_decoder_llm
 
     "$COMPILER" --decoder-llm "$DECODER_LLM_MANIFEST" \
       --kernel-library "$BUILD_DIR/generated_kernels"
     ;;
   paged-kv)
-    "$PYTHON" "$ROOT/tools/export_decoder_llm.py" \
-      --output "$DECODER_LLM_MANIFEST"
+    export_decoder_llm
 
     "$COMPILER" --paged-kv "$DECODER_LLM_MANIFEST" \
       --page-size 4 \
@@ -108,22 +187,27 @@ case "$MODE" in
       --kernel-library "$BUILD_DIR/generated_kernels"
     ;;
   serving)
-    "$PYTHON" "$ROOT/tools/export_decoder_llm.py" \
-      --output "$DECODER_LLM_MANIFEST"
+    export_decoder_llm
 
     "$COMPILER" --serving "$DECODER_LLM_MANIFEST" \
       --kernel-library "$BUILD_DIR/generated_kernels"
     ;;
   benchmark)
-    "$PYTHON" "$ROOT/tools/export_decoder_llm.py" \
-      --output "$DECODER_LLM_MANIFEST"
-
-    "$PYTHON" "$ROOT/tools/benchmark_decoder_mps.py" \
-      --warmup 2 --samples 10
-
-    "$COMPILER" --benchmark-decoder-llm "$DECODER_LLM_MANIFEST" \
-      --kernel-library "$BUILD_DIR/generated_kernels" \
-      --warmup 2 --samples 10
+    benchmark_decoder_pair "$DECODER_DTYPE"
+    ;;
+  benchmark-precision)
+    for precision_dtype in fp32 fp16 bf16; do
+      echo "Decoder MPS/Metal benchmark: $precision_dtype"
+      benchmark_decoder_pair "$precision_dtype"
+    done
+    ;;
+  precision)
+    for precision_dtype in fp32 fp16 bf16; do
+      echo "Decoder precision regression: $precision_dtype"
+      export_decoder_llm "$precision_dtype"
+      "$COMPILER" --decoder-llm "$DECODER_LLM_MANIFEST" \
+        --kernel-library "$BUILD_DIR/generated_kernels"
+    done
     ;;
   ablation)
     "$PYTHON" "$ROOT/tools/export_pytorch.py" \
@@ -142,6 +226,17 @@ case "$MODE" in
     echo "Advisor ablation: ON"
     "$COMPILER" --benchmark-import-pytorch "$MANIFEST" \
       --advisor-response "$RESPONSE"
+
+    export_decoder_llm
+    echo "Decoder generated-kernel ablation: OFF vs ON"
+    "$COMPILER" --benchmark-decoder-llm "$DECODER_LLM_MANIFEST" \
+      --kernel-library "$BUILD_DIR/generated_kernels" \
+      --warmup 2 --samples 10
+
+    echo "Decoder fusion ablation: OFF vs ON"
+    "$COMPILER" --benchmark-decoder-fusions "$DECODER_LLM_MANIFEST" \
+      --kernel-library "$BUILD_DIR/generated_kernels" \
+      --warmup 2 --samples 10
     ;;
   regression)
     echo "Regression: Metal baseline, autotuning, TensorIR, and fusion"
@@ -180,8 +275,7 @@ case "$MODE" in
     "$COMPILER" --transformer-decode "$DECODE_MANIFEST"
 
     echo "Regression: decoder-only runtime"
-    "$PYTHON" "$ROOT/tools/export_decoder_llm.py" \
-      --output "$DECODER_LLM_MANIFEST"
+    export_decoder_llm
     "$COMPILER" --decoder-llm "$DECODER_LLM_MANIFEST" \
       --kernel-library "$BUILD_DIR/generated_kernels"
 
@@ -190,6 +284,17 @@ case "$MODE" in
       --page-size 4 \
       --chunk-size 3 \
       --kernel-library "$BUILD_DIR/generated_kernels"
+
+    echo "Regression: continuous batching and preemption"
+    "$COMPILER" --serving "$DECODER_LLM_MANIFEST" \
+      --kernel-library "$BUILD_DIR/generated_kernels"
+
+    echo "Regression: decoder storage precision"
+    for precision_dtype in fp32 fp16 bf16; do
+      export_decoder_llm "$precision_dtype"
+      "$COMPILER" --decoder-llm "$DECODER_LLM_MANIFEST" \
+        --kernel-library "$BUILD_DIR/generated_kernels"
+    done
 
     echo "Regression: PASS"
     ;;

@@ -9,12 +9,13 @@
 
 namespace tensor::metal {
 
-enum class ElementType { Float16, Float32, Int32 };
+enum class ElementType { Float16, Float32, BFloat16, Int32 };
 
 struct HardwareInfo {
   std::size_t maxThreadsPerThreadgroup = 0;
   std::size_t maxThreadgroupMemoryLength = 0;
   std::size_t maxBufferLength = 0;
+  bool supportsBFloat16 = false;
 };
 
 struct PipelineBinding {
@@ -22,6 +23,7 @@ struct PipelineBinding {
   bool isBuffer = false;
   bool isFloat32 = false;
   bool isFloat16 = false;
+  bool isBFloat16 = false;
   bool isInt32 = false;
   bool isUInt32 = false;
   bool readOnly = false;

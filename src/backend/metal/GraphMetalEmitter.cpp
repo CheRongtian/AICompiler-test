@@ -1,6 +1,7 @@
 #include "backend/metal/MetalEmitter.hpp"
 #include "planner/KernelPlan.hpp"
 
+#include <algorithm>
 #include <iomanip>
 #include <limits>
 #include <locale>
@@ -14,6 +15,7 @@ const char *mslType(DType type) {
   switch (type) {
   case DType::Float16: return "half";
   case DType::Float32: return "float";
+  case DType::BFloat16: return "ushort";
   case DType::Int32: return "int";
   }
   throw std::invalid_argument("Unsupported Metal element type.");
@@ -118,6 +120,14 @@ std::string sliceIndex(const TensorType &input, const TensorType &output,
 } // namespace
 
 GeneratedKernel emitKernel(const planner::KernelPlan &plan) {
+  if (plan.outputType.dtype == DType::BFloat16 ||
+      std::any_of(plan.inputTypes.begin(), plan.inputTypes.end(),
+                  [](const TensorType &type) {
+                    return type.dtype == DType::BFloat16;
+                  })) {
+    throw std::invalid_argument(
+        "Generic Metal kernels do not support bf16 arithmetic.");
+  }
   if (plan.op == OpType::RMSNorm) {
     const auto &attributes = std::get<RMSNormAttributes>(plan.attributes);
     const RMSNormOp op{plan.inputTypes.at(0), plan.inputTypes.at(1), plan.outputType,

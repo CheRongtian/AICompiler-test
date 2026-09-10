@@ -4,7 +4,7 @@
 
 编译器提供的 `contract` 不可修改，并拥有最终约束权。Pattern principles 用于指导优化，不得覆盖 contract。
 
-1. 实现指定的数学语义、shape、fp32 运算、layout 和 dispatch 规则。
+1. 实现 contract 指定的数学语义、shape、storage dtype、fp32 accumulation、layout 和 dispatch 规则；严格区分 half、bfloat、float 绑定，并按语义要求保留低精度舍入位置。
 2. 完整保留 `contract.interface.buffers` 中的函数名及每个 binding：顺序、index、元素类型、地址空间和访问属性。每个输入和输出都必须实际使用，多输出 kernel 必须写入所有声明的输出。
 3. `workgroup_size` 只能从 `contract.legal_workgroup_sizes` 中选择。Host 按 `contract.dispatch` 派发，修改 source 无法改变 host 的派发规则。
    对于 `work_item_count threadgroups`，一个 group 负责一个输出 feature 或一行，组内线程协作归约。使用声明的 group/tid 参数，保持 barrier 一致到达、初始化不参与计算的 lane，并在归约完成后写入输出。对于 grid-thread 派发，一个 gid 负责一个 work item。不得混用这两种规则。

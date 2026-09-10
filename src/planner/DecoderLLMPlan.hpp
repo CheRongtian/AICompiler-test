@@ -12,6 +12,7 @@ struct DecoderLLMPlan {
   std::size_t intermediateSize = 1;
   std::size_t vocabularySize = 1;
   float rmsNormEpsilon = 1e-5f;
+  DType accumulationDtype = DType::Float32;
 
   [[nodiscard]] std::size_t hiddenSize() const;
   [[nodiscard]] std::size_t hiddenElementCount(std::size_t sequenceLength) const;

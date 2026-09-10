@@ -1,3 +1,4 @@
 build/
 .venv_ai_compiler/
 .env
+*.log

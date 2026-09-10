@@ -75,10 +75,6 @@ std::string writeFeedback(const Feedback &feedback, const std::string &path) {
 }
 
 
-std::vector<metal::ElementType> fp32(std::size_t count) {
-  return std::vector<metal::ElementType>(count, metal::ElementType::Float32);
-}
-
 struct CaseExecution {
   std::unique_ptr<metal::PreparedSequence> sequence;
   std::vector<metal::BufferHandle> outputs;
@@ -99,7 +95,8 @@ std::unique_ptr<CaseExecution> prepare(
     buffers.push_back(std::move(buffer.buffer));
   }
   for (const auto &reference : data.references) {
-    auto buffer = runtime.createBuffer(reference.size()+(generated?kGuardElements:0));
+    auto buffer = runtime.createBuffer(reference.size()+(generated?kGuardElements:0),nullptr,
+                                       contract.storageType);
     if (!buffer.buffer) throw std::runtime_error(buffer.errorMessage);
     buffers.push_back(buffer.buffer);
     result->outputs.push_back(std::move(buffer.buffer));
@@ -107,7 +104,7 @@ std::unique_ptr<CaseExecution> prepare(
   std::vector<std::unique_ptr<metal::PreparedExecution>> steps;
   if (baseline) {
     for (auto count : baseline->intermediateCounts) {
-      auto buffer = runtime.createBuffer(count);
+      auto buffer = runtime.createBuffer(count,nullptr,contract.storageType);
       if (!buffer.buffer) throw std::runtime_error(buffer.errorMessage);
       buffers.push_back(std::move(buffer.buffer));
     }
@@ -227,6 +224,9 @@ bool admitGeneratedKernel(metal::MetalRuntime &runtime,
   };
   try {
     const auto contract = llm::makeKernelContract(pattern);
+    if(contract.storageType==metal::ElementType::BFloat16 &&
+       !runtime.hardwareInfo().supportsBFloat16)
+      return report({"fatal","hardware_filter","Native bf16 is unavailable; generate an fp16 contract."});
     std::vector<Baseline> baselines;
     for (std::size_t i = 0; i < contract.cases.size(); ++i) {
       log << "Template baseline case " << i << '\n';
@@ -247,7 +247,8 @@ bool admitGeneratedKernel(metal::MetalRuntime &runtime,
       return report({"retry", "compile", pipeline.errorMessage});
     log << "Generated candidate compile: PASS\n";
     const auto interfaceError = metal::checkBufferInterface(
-        pipeline, contract.inputTypes, fp32(contract.outputNames.size()), true);
+        pipeline, contract.inputTypes,
+        std::vector<metal::ElementType>(contract.outputNames.size(),contract.storageType), true);
     if (!interfaceError.empty())
       return report({"retry", "interface", interfaceError});
     if (candidate.workgroupSize > pipeline.maxTotalThreadsPerThreadgroup ||

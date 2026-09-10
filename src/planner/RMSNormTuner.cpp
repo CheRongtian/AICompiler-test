@@ -20,8 +20,9 @@ constexpr double kAbsoluteTolerance = 1e-5;
 constexpr double kRelativeTolerance = 1e-4;
 
 metal::ElementType elementType(DType dtype) {
-  return dtype == DType::Float16 ? metal::ElementType::Float16
-                                 : metal::ElementType::Float32;
+  if (dtype == DType::Float16) return metal::ElementType::Float16;
+  if (dtype == DType::BFloat16) return metal::ElementType::BFloat16;
+  return metal::ElementType::Float32;
 }
 
 void reject(CandidateReport &report, const std::string &stage,

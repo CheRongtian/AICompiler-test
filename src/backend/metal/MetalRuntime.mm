@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <unordered_map>
 #include <utility>
 
 namespace tensor::metal {
@@ -33,7 +34,9 @@ std::string errorMessage(NSError *error, const std::string &fallback) {
 }
 
 std::size_t elementSize(ElementType type) {
-  return type == ElementType::Float16 ? sizeof(std::uint16_t) : sizeof(std::uint32_t);
+  return (type == ElementType::Float16 || type == ElementType::BFloat16)
+             ? sizeof(std::uint16_t)
+             : sizeof(std::uint32_t);
 }
 
 std::uint16_t floatToHalf(float value) {
@@ -86,6 +89,20 @@ float halfToFloat(std::uint16_t value) {
   return result;
 }
 
+std::uint16_t floatToBFloat16(float value) {
+  std::uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const std::uint32_t rounding = 0x7fffu + ((bits >> 16) & 1u);
+  return static_cast<std::uint16_t>((bits + rounding) >> 16);
+}
+
+float bfloat16ToFloat(std::uint16_t value) {
+  const std::uint32_t bits = static_cast<std::uint32_t>(value) << 16;
+  float result;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
+}
+
 } // namespace
 
 std::string checkFloatBufferInterface(const ComputePipelineResult &pipeline,
@@ -123,9 +140,14 @@ std::string checkBufferInterface(const ComputePipelineResult &pipeline,
     }
     const auto expected = binding.index < inputs.size()
         ? inputs[binding.index] : outputs[binding.index - inputs.size()];
-    const bool typeMatches = expected == ElementType::Float32 ? binding.isFloat32
-                           : expected == ElementType::Float16 ? binding.isFloat16
-                                                              : binding.isInt32;
+    const bool typeMatches =
+        expected == ElementType::Float32
+            ? binding.isFloat32
+            : expected == ElementType::Float16
+                  ? binding.isFloat16
+                  : expected == ElementType::BFloat16
+                        ? binding.isBFloat16
+                        : binding.isInt32;
     if (!typeMatches) return "Reflected buffer element type disagrees with TensorIR.";
     if ((binding.index < inputs.size() && !binding.readOnly) ||
         (binding.index >= inputs.size() && !binding.writable)) {
@@ -153,6 +175,9 @@ std::vector<float> MetalBuffer::read() const {
   } else if (impl_->type == ElementType::Float16) {
     const auto *source = static_cast<const std::uint16_t *>(impl_->buffer.contents);
     for (std::size_t i = 0; i < result.size(); ++i) result[i] = halfToFloat(source[i]);
+  } else if (impl_->type == ElementType::BFloat16) {
+    const auto *source = static_cast<const std::uint16_t *>(impl_->buffer.contents);
+    for (std::size_t i = 0; i < result.size(); ++i) result[i] = bfloat16ToFloat(source[i]);
   } else {
     const auto *source = static_cast<const std::int32_t *>(impl_->buffer.contents);
     for (std::size_t i = 0; i < result.size(); ++i) result[i] = static_cast<float>(source[i]);
@@ -181,6 +206,8 @@ public:
                         std::numeric_limits<float>::quiet_NaN());
           else if (buffer->elementType() == ElementType::Float16)
             std::fill_n(static_cast<std::uint16_t *>(output.contents), count, 0x7e00u);
+          else if (buffer->elementType() == ElementType::BFloat16)
+            std::fill_n(static_cast<std::uint16_t *>(output.contents), count, 0x7fc0u);
           else
             std::fill_n(static_cast<std::int32_t *>(output.contents), count,
                         std::numeric_limits<std::int32_t>::min());
@@ -320,6 +347,11 @@ ExecutionResult PreparedSequence::execute() const { return impl_->execute(); }
 
 class MetalRuntime::Impl {
 public:
+  struct CachedPipeline {
+    id<MTLComputePipelineState> pipeline = nil;
+    ComputePipelineResult metadata;
+  };
+
   Impl() {
     @autoreleasepool {
       device_ = MTLCreateSystemDefaultDevice();
@@ -353,8 +385,13 @@ public:
     if (device_ == nil) {
       return {};
     }
+    bool nativeBFloat16 = false;
+    if (@available(macOS 14.0, *)) {
+      nativeBFloat16 = [device_ supportsFamily:MTLGPUFamilyApple9];
+    }
     return {device_.maxThreadsPerThreadgroup.width,
-            device_.maxThreadgroupMemoryLength, device_.maxBufferLength};
+            device_.maxThreadgroupMemoryLength, device_.maxBufferLength,
+            nativeBFloat16};
   }
 
   [[nodiscard]] ComputePipelineResult
@@ -371,6 +408,17 @@ public:
         return result;
       }
 
+      std::string cacheKey;
+      cacheKey.reserve(functionName.size() + source.size() + 1);
+      cacheKey.append(functionName);
+      cacheKey.push_back('\0');
+      cacheKey.append(source);
+      const auto cached = pipelineCache_.find(cacheKey);
+      if (cached != pipelineCache_.end()) {
+        pipeline_ = cached->second.pipeline;
+        return cached->second.metadata;
+      }
+
       NSString *sourceString =
           [[NSString alloc] initWithBytes:source.data()
                                   length:source.size()
@@ -381,9 +429,13 @@ public:
       }
 
       NSError *libraryError = nil;
+      MTLCompileOptions *compileOptions = [[MTLCompileOptions alloc] init];
+      if (@available(macOS 14.0, *)) {
+        compileOptions.languageVersion = MTLLanguageVersion3_1;
+      }
       id<MTLLibrary> library =
           [device_ newLibraryWithSource:sourceString
-                                options:nil
+                                options:compileOptions
                                   error:&libraryError];
       if (library == nil) {
         result.errorMessage = errorMessage(
@@ -444,12 +496,17 @@ public:
           id<MTLBufferBinding> buffer = (id<MTLBufferBinding>)binding;
           info.isFloat32 = buffer.bufferDataType == MTLDataTypeFloat;
           info.isFloat16 = buffer.bufferDataType == MTLDataTypeHalf;
+          if (@available(macOS 14.0, *)) {
+            info.isBFloat16 = buffer.bufferDataType == MTLDataTypeBFloat;
+          }
           info.isInt32 = buffer.bufferDataType == MTLDataTypeInt;
           info.isUInt32 = buffer.bufferDataType == MTLDataTypeUInt;
         }
         result.bindings.push_back(info);
       }
       pipeline_ = pipeline;
+      pipelineCache_.emplace(
+          std::move(cacheKey), CachedPipeline{pipeline, result});
     }
 
     return result;
@@ -482,6 +539,9 @@ public:
       } else if (initialData && type == ElementType::Float16) {
         auto *destination = static_cast<std::uint16_t *>(storage->buffer.contents);
         for (std::size_t i = 0; i < count; ++i) destination[i] = floatToHalf(initialData[i]);
+      } else if (initialData && type == ElementType::BFloat16) {
+        auto *destination = static_cast<std::uint16_t *>(storage->buffer.contents);
+        for (std::size_t i = 0; i < count; ++i) destination[i] = floatToBFloat16(initialData[i]);
       } else if (initialData) {
         auto *destination = static_cast<std::int32_t *>(storage->buffer.contents);
         for (std::size_t i = 0; i < count; ++i) destination[i] = static_cast<std::int32_t>(initialData[i]);
@@ -490,6 +550,8 @@ public:
                     std::numeric_limits<float>::quiet_NaN());
       } else if (type == ElementType::Float16) {
         std::fill_n(static_cast<std::uint16_t *>(storage->buffer.contents), count, 0x7e00u);
+      } else if (type == ElementType::BFloat16) {
+        std::fill_n(static_cast<std::uint16_t *>(storage->buffer.contents), count, 0x7fc0u);
       } else {
         std::fill_n(static_cast<std::int32_t *>(storage->buffer.contents), count, 0);
       }
@@ -515,6 +577,10 @@ public:
       auto *destination =
           static_cast<std::uint16_t *>(buffer->impl_->buffer.contents) + offset;
       for (std::size_t i = 0; i < count; ++i) destination[i] = floatToHalf(data[i]);
+    } else if (buffer->impl_->type == ElementType::BFloat16) {
+      auto *destination =
+          static_cast<std::uint16_t *>(buffer->impl_->buffer.contents) + offset;
+      for (std::size_t i = 0; i < count; ++i) destination[i] = floatToBFloat16(data[i]);
     } else {
       auto *destination =
           static_cast<std::int32_t *>(buffer->impl_->buffer.contents) + offset;
@@ -601,6 +667,7 @@ private:
   id<MTLDevice> device_ = nil;
   id<MTLCommandQueue> commandQueue_ = nil;
   id<MTLComputePipelineState> pipeline_ = nil;
+  std::unordered_map<std::string, CachedPipeline> pipelineCache_;
   std::string initializationError_;
 };
 

@@ -10,6 +10,13 @@
 namespace tensor::metal {
 namespace {
 
+const char *argmaxStorageType(ElementType type) {
+  if (type == ElementType::Float16) return "half";
+  if (type == ElementType::BFloat16) return "bfloat";
+  if (type == ElementType::Float32) return "float";
+  throw std::invalid_argument("Token argmax supports fp16, bf16, or fp32 logits.");
+}
+
 GeneratedKernel beginKernel(std::size_t workItems, std::size_t threads,
                             const std::string &functionName) {
   if (workItems == 0 || threads == 0 || functionName.empty()) {
@@ -190,23 +197,59 @@ GeneratedKernel emitCrossAttention(
 
 GeneratedKernel emitTokenArgmax(
     std::size_t rows, std::size_t vocabularySize,
-    std::size_t threadsPerThreadgroup, const std::string &functionName) {
-  auto kernel = beginKernel(rows, threadsPerThreadgroup, functionName);
+    std::size_t threadsPerThreadgroup, const std::string &functionName,
+    ElementType storageType) {
+  if (rows == 0 || vocabularySize == 0 || threadsPerThreadgroup == 0 ||
+      threadsPerThreadgroup > 1024 ||
+      (threadsPerThreadgroup & (threadsPerThreadgroup - 1)) != 0 ||
+      functionName.empty()) {
+    throw std::invalid_argument(
+        "Token argmax requires a nonzero power-of-two threadgroup size.");
+  }
+  GeneratedKernel kernel;
+  kernel.functionName = functionName;
+  kernel.threadsPerThreadgroup = threadsPerThreadgroup;
+  kernel.threadgroupCount = rows;
+  const auto *type = argmaxStorageType(storageType);
   std::ostringstream source;
   source << "#include <metal_stdlib>\nusing namespace metal;\n\n"
          << "kernel void " << functionName << "(\n"
-         << "  device const float *logits [[buffer(0)]],\n"
+         << "  device const " << type << " *logits [[buffer(0)]],\n"
          << "  device int *tokens [[buffer(1)]],\n"
-         << "  uint row [[thread_position_in_grid]]) {\n"
-         << "  if (row >= " << rows << "u) return;\n"
+         << "  uint tid [[thread_index_in_threadgroup]],\n"
+         << "  uint row [[threadgroup_position_in_grid]]) {\n"
+         << "  threadgroup float bestValues[" << threadsPerThreadgroup
+         << "];\n"
+         << "  threadgroup int bestTokens[" << threadsPerThreadgroup << "];\n"
          << "  const uint base = row * " << vocabularySize << "u;\n"
-         << "  float best = logits[base];\n"
-         << "  int selected = 0;\n"
-         << "  for (uint token = 1; token < " << vocabularySize << "u; ++token) {\n"
-         << "    const float candidate = logits[base + token];\n"
-         << "    if (candidate > best) { best = candidate; selected = int(token); }\n"
+         << "  float best = -INFINITY;\n"
+         << "  int selected = -1;\n"
+         << "  for (uint token = tid; token < " << vocabularySize
+         << "u; token += " << threadsPerThreadgroup << "u) {\n"
+         << "    const float candidate = float(logits[base + token]);\n"
+         << "    if (candidate > best || (candidate == best && "
+            "(selected < 0 || int(token) < selected))) {\n"
+         << "      best = candidate; selected = int(token);\n"
+         << "    }\n"
          << "  }\n"
-         << "  tokens[row] = selected;\n"
+         << "  bestValues[tid] = best;\n"
+         << "  bestTokens[tid] = selected;\n"
+         << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         << "  for (uint offset = " << threadsPerThreadgroup / 2
+         << "u; offset > 0u; offset >>= 1u) {\n"
+         << "    if (tid < offset) {\n"
+         << "      const float candidate = bestValues[tid + offset];\n"
+         << "      const int candidateToken = bestTokens[tid + offset];\n"
+         << "      if (candidate > bestValues[tid] || "
+            "(candidate == bestValues[tid] && candidateToken >= 0 && "
+            "(bestTokens[tid] < 0 || candidateToken < bestTokens[tid]))) {\n"
+         << "        bestValues[tid] = candidate;\n"
+         << "        bestTokens[tid] = candidateToken;\n"
+         << "      }\n"
+         << "    }\n"
+         << "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         << "  }\n"
+         << "  if (tid == 0u) tokens[row] = bestTokens[0];\n"
          << "}\n";
   kernel.source = source.str();
   return kernel;

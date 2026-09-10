@@ -10,12 +10,20 @@
 #include <optional>
 #include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 
 constexpr double kAbsoluteTolerance = 1e-3;
 constexpr double kRelativeTolerance = 5e-3;
+
+std::pair<double, double> tolerances(tensor::DType dtype) {
+  if (dtype == tensor::DType::Float16 || dtype == tensor::DType::BFloat16) {
+    return {2e-2, 2e-2};
+  }
+  return {kAbsoluteTolerance, kRelativeTolerance};
+}
 
 struct TimingSeries {
   std::vector<double> prefillGpu;
@@ -52,13 +60,15 @@ void collect(const tensor::runtime::DecoderLLMRunResult &result,
 bool runGeneration(tensor::runtime::CompiledDecoderLLM &decoder,
                    const tensor::DecoderLLMWorkload &workload,
                    TimingSeries *timings, bool validate,
-                   std::string &error) {
+                   std::string &error, bool tokenOnly = false) {
+  const auto [absoluteTolerance, relativeTolerance] =
+      tolerances(decoder.storageDtype());
   error = decoder.reset();
   if (!error.empty()) return false;
 
   const auto totalStart = std::chrono::steady_clock::now();
   const auto prefillStart = std::chrono::steady_clock::now();
-  const auto prefill = decoder.prefill(workload.prefill.tokenIds);
+  const auto prefill = decoder.prefill(workload.prefill.tokenIds,!tokenOnly);
   const auto prefillEnd = std::chrono::steady_clock::now();
   if (!prefill.passed) {
     error = "prefill execution: " + prefill.errorMessage;
@@ -69,8 +79,8 @@ bool runGeneration(tensor::runtime::CompiledDecoderLLM &decoder,
               .count(),
           true, timings);
   if (validate) {
-    if (!compare("prefill logits", prefill.logits, workload.prefill.logits,
-                 kAbsoluteTolerance, kRelativeTolerance, error) ||
+    if ((!tokenOnly && !compare("prefill logits", prefill.logits, workload.prefill.logits,
+                 absoluteTolerance, relativeTolerance, error)) ||
         !compare("prefill token", prefill.nextTokenIds,
                  workload.prefill.nextTokenIds, 0.0, 0.0, error)) {
       return false;
@@ -89,7 +99,7 @@ bool runGeneration(tensor::runtime::CompiledDecoderLLM &decoder,
       }
     }
     const auto decodeStart = std::chrono::steady_clock::now();
-    const auto result = decoder.decode(nextTokens);
+    const auto result = decoder.decode(nextTokens,!tokenOnly);
     const auto decodeEnd = std::chrono::steady_clock::now();
     if (!result.passed) {
       error = "decode step " + std::to_string(step) + ": " +
@@ -101,9 +111,9 @@ bool runGeneration(tensor::runtime::CompiledDecoderLLM &decoder,
                 .count(),
             false, timings);
     if (validate) {
-      if (!compare("decode logits " + std::to_string(step), result.logits,
-                   reference.logits, kAbsoluteTolerance, kRelativeTolerance,
-                   error) ||
+      if ((!tokenOnly && !compare("decode logits " + std::to_string(step), result.logits,
+                   reference.logits, absoluteTolerance, relativeTolerance,
+                   error)) ||
           !compare("decode token " + std::to_string(step),
                    result.nextTokenIds, reference.nextTokenIds, 0.0, 0.0,
                    error)) {
@@ -127,11 +137,11 @@ bool runGeneration(tensor::runtime::CompiledDecoderLLM &decoder,
   for (std::size_t layer = 0; layer < finalReference.keyCaches.size(); ++layer) {
     if (!compare("final key cache " + std::to_string(layer),
                  decoder.readKeyPrefix(layer), finalReference.keyCaches[layer],
-                 kAbsoluteTolerance, kRelativeTolerance, error) ||
+                 absoluteTolerance, relativeTolerance, error) ||
         !compare("final value cache " + std::to_string(layer),
                  decoder.readValuePrefix(layer),
-                 finalReference.valueCaches[layer], kAbsoluteTolerance,
-                 kRelativeTolerance, error)) {
+                 finalReference.valueCaches[layer], absoluteTolerance,
+                 relativeTolerance, error)) {
       return false;
     }
   }
@@ -169,7 +179,8 @@ std::optional<double> p50(const std::vector<double> &values) {
 }
 
 void report(const std::string &name, const TimingSeries &timings,
-            std::size_t decodeSteps, std::size_t kvBytes,
+            std::size_t decodeSteps,
+            const tensor::runtime::CompiledDecoderLLM &decoder,
             std::ostream &log) {
   log << name << ":\n";
   printDistribution("Prefill GPU command time (us)", timings.prefillGpu, log);
@@ -183,6 +194,8 @@ void report(const std::string &name, const TimingSeries &timings,
                     timings.decodeCpu, log);
   printDistribution("Decode end-to-end time (us/token)",
                     timings.decodeEndToEnd, log);
+  printDistribution("TTFT (us)", timings.prefillEndToEnd, log);
+  printDistribution("TPOT (us/token)", timings.decodeEndToEnd, log);
   printDistribution("Total generation time (us)", timings.totalGeneration,
                     log);
   const auto decodeMedian = p50(timings.decodeEndToEnd);
@@ -193,13 +206,24 @@ void report(const std::string &name, const TimingSeries &timings,
     log << "  Decode throughput (tokens/s): unavailable\n";
   }
   log << "  Decode steps per measured run: " << decodeSteps << '\n'
-      << "  Fixed KV storage (bytes): " << kvBytes << '\n';
+      << "  Storage dtype: " << tensor::dtypeName(decoder.storageDtype())
+      << '\n'
+      << "  Precision fallback: "
+      << (decoder.precisionFallbackUsed() ? "true" : "false") << '\n'
+      << "  Model storage (bytes): " << decoder.modelStorageBytes() << '\n'
+      << "  KV storage (bytes): " << decoder.kvStorageBytes() << '\n'
+      << "  Allocated activation storage (bytes): "
+      << decoder.activationStorageBytes() << '\n'
+      << "  Planned peak model + KV + activation (bytes): "
+      << decoder.modelStorageBytes() + decoder.kvStorageBytes() +
+             decoder.activationStorageBytes()
+      << '\n';
 }
 
 bool prepareForMeasurement(tensor::runtime::CompiledDecoderLLM &decoder,
                            const tensor::DecoderLLMWorkload &workload,
                            const std::string &label, std::size_t warmupRuns,
-                           std::ostream &log) {
+                           std::ostream &log, bool tokenOnly = false) {
   std::string error;
   if (!runGeneration(decoder, workload, nullptr, true, error)) {
     log << label << " correctness: FAIL\n"
@@ -207,8 +231,12 @@ bool prepareForMeasurement(tensor::runtime::CompiledDecoderLLM &decoder,
     return false;
   }
   log << label << " correctness: PASS\n";
+  if(tokenOnly && !runGeneration(decoder,workload,nullptr,true,error,true)) {
+    log << label << " token-only correctness: FAIL: " << error << '\n';
+    return false;
+  }
   for (std::size_t run = 0; run < warmupRuns; ++run) {
-    if (!runGeneration(decoder, workload, nullptr, false, error)) {
+    if (!runGeneration(decoder, workload, nullptr, false, error,tokenOnly)) {
       log << label << " warmup: FAIL\n"
           << "Benchmark error: " << error << '\n';
       return false;
@@ -240,35 +268,48 @@ bool runDecoderLLMBenchmark(tensor::metal::MetalRuntime &runtime,
   log << "Decoder benchmark import: PASS\n"
       << "Benchmark protocol: paired alternating order, warmup="
       << options.warmupRuns << ", measured_runs=" << options.measuredRuns
+      << ", readback=" << (options.tokenOnly?"tokens":"logits+tokens")
+      << ", comparison=" << (options.compareFusions?"fusion_off_vs_on":"generated_off_vs_on")
       << '\n';
 
-  log << "Compiling template-only decoder:\n";
+  const std::string baselineLabel = options.compareFusions ? "Fusion-off" : "Template-only";
+  const std::string comparisonLabel = options.compareFusions ? "Fusion-on" : "Generated-enabled";
+  log << "Compiling " << baselineLabel << " decoder:\n";
   tensor::runtime::DecoderLLMCompileOptions templateOptions;
+  templateOptions.storageDtype = workload.plan.attention.dtype;
+  templateOptions.requestedStorageDtype = workload.requestedStorageDtype;
+  templateOptions.allowPrecisionFallback = true;
+  templateOptions.enableFusion = !options.compareFusions;
   auto templateCompilation = tensor::runtime::compileDecoderLLM(
       runtime, workload, log, templateOptions);
   if (!templateCompilation.executable) {
-    log << "Template-only compilation: FAIL\n"
+    log << baselineLabel << " compilation: FAIL\n"
         << "Compiler error: " << templateCompilation.errorMessage << '\n';
     return false;
   }
 
-  log << "Compiling generated-enabled decoder:\n";
+  log << "Compiling " << comparisonLabel << " decoder:\n";
   tensor::runtime::DecoderLLMCompileOptions generatedOptions;
-  generatedOptions.kernelLibrary = options.kernelLibrary;
+  if (!options.compareFusions) generatedOptions.kernelLibrary = options.kernelLibrary;
+  generatedOptions.storageDtype = workload.plan.attention.dtype;
+  generatedOptions.requestedStorageDtype = workload.requestedStorageDtype;
+  generatedOptions.allowPrecisionFallback = true;
+  generatedOptions.enableFusion = true;
+  generatedOptions.sharedModelResources=templateCompilation.executable->sharedModelResources();
   auto generatedCompilation = tensor::runtime::compileDecoderLLM(
       runtime, workload, log, generatedOptions);
   if (!generatedCompilation.executable) {
-    log << "Generated-enabled compilation: FAIL\n"
+    log << comparisonLabel << " compilation: FAIL\n"
         << "Compiler error: " << generatedCompilation.errorMessage << '\n';
     return false;
   }
 
   auto &templateDecoder = *templateCompilation.executable;
   auto &generatedDecoder = *generatedCompilation.executable;
-  if (!prepareForMeasurement(templateDecoder, workload, "Template-only",
-                             options.warmupRuns, log) ||
-      !prepareForMeasurement(generatedDecoder, workload, "Generated-enabled",
-                             options.warmupRuns, log)) {
+  if (!prepareForMeasurement(templateDecoder, workload, baselineLabel,
+                             options.warmupRuns, log,options.tokenOnly) ||
+      !prepareForMeasurement(generatedDecoder, workload, comparisonLabel,
+                             options.warmupRuns, log,options.tokenOnly)) {
     return false;
   }
 
@@ -280,7 +321,7 @@ bool runDecoderLLMBenchmark(tensor::metal::MetalRuntime &runtime,
       const bool runTemplate = (sample + position) % 2 == 0;
       auto &decoder = runTemplate ? templateDecoder : generatedDecoder;
       auto &timings = runTemplate ? templateTimings : generatedTimings;
-      if (!runGeneration(decoder, workload, &timings, false, error)) {
+      if (!runGeneration(decoder, workload, &timings, false, error,options.tokenOnly)) {
         log << "Decoder benchmark execution: FAIL\n"
             << "Benchmark error: " << error << '\n';
         return false;
@@ -288,36 +329,36 @@ bool runDecoderLLMBenchmark(tensor::metal::MetalRuntime &runtime,
     }
   }
 
-  const auto &plan = workload.plan;
-  const auto kvBytes = plan.layerCount * 2 * plan.attention.batch *
-                       plan.attention.heads * plan.attention.capacity *
-                       plan.attention.headDimension * sizeof(float);
   log << "Decoder benchmark results (times in microseconds):\n";
-  report("Template-only", templateTimings, workload.decodeSteps.size(),
-         kvBytes, log);
-  report("Generated-enabled", generatedTimings, workload.decodeSteps.size(),
-         kvBytes, log);
+  report(baselineLabel, templateTimings, workload.decodeSteps.size(),
+         templateDecoder, log);
+  report(comparisonLabel, generatedTimings, workload.decodeSteps.size(),
+         generatedDecoder, log);
 
   const auto templateGpu = p50(templateTimings.decodeGpu);
   const auto generatedGpu = p50(generatedTimings.decodeGpu);
   const auto templateEndToEnd = p50(templateTimings.decodeEndToEnd);
   const auto generatedEndToEnd = p50(generatedTimings.decodeEndToEnd);
   if (templateGpu && generatedGpu && *generatedGpu > 0.0) {
-    log << "Generated on/off decode GPU speedup: "
+    log << (options.compareFusions ? "Fusion on/off" : "Generated on/off")
+        << " decode GPU speedup: "
         << *templateGpu / *generatedGpu << "x\n";
   } else {
-    log << "Generated on/off decode GPU speedup: unavailable\n";
+    log << (options.compareFusions ? "Fusion on/off" : "Generated on/off")
+        << " decode GPU speedup: unavailable\n";
   }
   if (templateEndToEnd && generatedEndToEnd && *generatedEndToEnd > 0.0) {
-    log << "Generated on/off decode end-to-end speedup: "
+    log << (options.compareFusions ? "Fusion on/off" : "Generated on/off")
+        << " decode end-to-end speedup: "
         << *templateEndToEnd / *generatedEndToEnd << "x\n";
   } else {
-    log << "Generated on/off decode end-to-end speedup: unavailable\n";
+    log << (options.compareFusions ? "Fusion on/off" : "Generated on/off")
+        << " decode end-to-end speedup: unavailable\n";
   }
 
-  log << "Template-only runtime audit:\n";
+  log << baselineLabel << " runtime audit:\n";
   templateDecoder.reportKernelUsage(log);
-  log << "Generated-enabled runtime audit:\n";
+  log << comparisonLabel << " runtime audit:\n";
   generatedDecoder.reportKernelUsage(log);
   log << "Decoder benchmark: PASS\n";
   return true;

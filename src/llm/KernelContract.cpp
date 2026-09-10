@@ -3,6 +3,8 @@
 #include "analyzer/PatternAnalyzer.hpp"
 
 #include <cmath>
+#include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -25,7 +27,76 @@ std::string quote(const std::string &value) {
 }
 }
 
+std::string typedKernelPattern(const std::string &pattern, metal::ElementType type) {
+  return pattern + (type == metal::ElementType::Float16 ? "_fp16" :
+                    type == metal::ElementType::BFloat16 ? "_bf16" : "");
+}
+
 KernelContract makeKernelContract(const std::string &pattern) {
+  if (pattern.size() > 5 && (pattern.substr(pattern.size()-5)=="_fp16" ||
+                             pattern.substr(pattern.size()-5)=="_bf16")) {
+    const auto base=pattern.substr(0,pattern.size()-5);
+    auto c=makeDecoderKernelContract(base);
+    c.pattern=pattern;
+    c.functionName="generated_"+pattern;
+    c.storageType=pattern.substr(pattern.size()-5)=="_fp16"
+        ? metal::ElementType::Float16 : metal::ElementType::BFloat16;
+    c.absoluteTolerance=2e-2;
+    c.relativeTolerance=2e-2;
+    for (std::size_t i=0;i<c.inputTypes.size();++i)
+      if (c.inputTypes[i]==metal::ElementType::Float32 &&
+          !(base=="decoder_rope" && (i==2 || i==3))) c.inputTypes[i]=c.storageType;
+    // Generated fixtures are powers-of-two fractions, exactly representable
+    // in both formats. Round intermediate/output values at storage boundaries.
+    auto rounded=[&](double value) -> double {
+      float f=static_cast<float>(value);
+      if (!std::isfinite(f) || f==0) return f;
+      if (c.storageType==metal::ElementType::BFloat16) {
+        std::uint32_t bits; std::memcpy(&bits,&f,sizeof(bits));
+        bits=(bits+0x7fffu+((bits>>16)&1u))&0xffff0000u;
+        std::memcpy(&f,&bits,sizeof(f)); return f;
+      }
+      const double magnitude=std::abs(double(f));
+      if (magnitude>=65520) return std::copysign(INFINITY,f);
+      int exponent=0; std::frexp(magnitude,&exponent);
+      const double unit=std::ldexp(1.0,std::max(exponent-11,-24));
+      return std::copysign(std::nearbyint(magnitude/unit)*unit,f);
+    };
+    for (auto &data:c.cases) {
+      for (std::size_t i=0;i<data.inputs.size();++i)
+        if (c.inputTypes[i]==c.storageType)
+          for(auto &v:data.inputs[i]) v=static_cast<float>(rounded(v));
+      if(base=="decoder_residual_rmsnorm") {
+        double squares=0;
+        for(std::size_t i=0;i<data.references[0].size();++i) {
+          const double v=rounded(data.inputs[0][i]+data.inputs[1][i]);
+          data.references[0][i]=v; squares+=v*v;
+        }
+        const double inverse=1/std::sqrt(squares/data.references[0].size()+1e-5);
+        for(std::size_t i=0;i<data.references[1].size();++i)
+          data.references[1][i]=rounded(data.references[0][i]*inverse*data.inputs[2][i]);
+      } else if(base=="decoder_gated_mlp") {
+        const auto width=data.inputs[0].size();
+        for(std::size_t j=0;j<data.references[0].size();++j) {
+          double gate=0,up=0;
+          for(std::size_t i=0;i<width;++i) {
+            gate+=double(data.inputs[0][i])*data.inputs[1][j*width+i];
+            up+=double(data.inputs[0][i])*data.inputs[2][j*width+i];
+          }
+          gate=rounded(gate); up=rounded(up);
+          data.references[0][j]=rounded(rounded(gate/(1+std::exp(-gate)))*up);
+        }
+      } else {
+        for(auto &output:data.references) for(auto &v:output) v=rounded(v);
+      }
+    }
+    c.applicability="Decoder-only batch=1, sequence_length=1, storage="+
+        pattern.substr(pattern.size()-4)+"; original shape constraints apply.";
+    c.semantics += " Storage is low precision; cast inputs to float for all arithmetic and "
+        "reductions. Round residual sums, Gate/Up projections, SiLU results and final "
+        "outputs to storage dtype. RoPE tables stay fp32; accumulation stays fp32.";
+    return c;
+  }
   KernelContract contract;
   contract.pattern = pattern;
   if (pattern == "silu_mul") {
@@ -156,7 +227,14 @@ std::string serializeKernelContract(const metal::MetalRuntime &runtime,
                                     const KernelContract &contract) {
   std::ostringstream out;
   const auto hw = runtime.hardwareInfo();
-  out << "{\"version\":2,\"pattern\":" << quote(contract.pattern)
+  const auto typeName=[](metal::ElementType type) {
+    return type==metal::ElementType::Float16 ? "half" :
+           type==metal::ElementType::BFloat16 ? "bfloat" :
+           type==metal::ElementType::Int32 ? "int" : "float";
+  };
+  out << "{\"version\":3,\"pattern\":" << quote(contract.pattern)
+      << ",\"storage_dtype\":" << quote(typeName(contract.storageType))
+      << ",\"accumulation_dtype\":\"float\""
       << ",\"applicability\":" << quote(contract.applicability)
       << ",\"target\":{\"backend\":\"metal\",\"device\":" << quote(runtime.deviceName())
       << ",\"max_threads_per_threadgroup\":" << hw.maxThreadsPerThreadgroup
@@ -168,13 +246,13 @@ std::string serializeKernelContract(const metal::MetalRuntime &runtime,
   for (const auto &name : contract.inputNames) {
     if (binding) out << ',';
     out << "{\"index\":" << binding++ << ",\"role\":" << quote(name)
-        << ",\"type\":" << quote(contract.inputTypes[binding - 1] == metal::ElementType::Int32
-                                      ? "device const int*" : "device const float*")
+        << ",\"type\":" << quote(std::string("device const ")+typeName(contract.inputTypes[binding-1])+"*")
         << ",\"access\":\"read\"}";
   }
   for (const auto &name : contract.outputNames)
     out << ",{\"index\":" << binding++ << ",\"role\":" << quote(name)
-        << ",\"type\":\"device float*\",\"access\":\"write\"}";
+        << ",\"type\":" << quote(std::string("device ")+typeName(contract.storageType)+"*")
+        << ",\"access\":\"write\"}";
   out << ",{\"index\":" << binding
       << ",\"role\":\"work_item_count\",\"type\":\"constant uint&\",\"access\":\"read\"}]}"
       << ",\"dispatch\":{\"policy\":"
@@ -194,7 +272,8 @@ std::string serializeKernelContract(const metal::MetalRuntime &runtime,
       if (j) out << ',';
       out << data.shape[j];
     }
-    out << "],\"dtype\":\"float32\",\"layout\":\"contiguous\",\"input_element_counts\":[";
+    out << "],\"dtype\":" << quote(typeName(contract.storageType))
+        << ",\"layout\":\"contiguous\",\"input_element_counts\":[";
     for (std::size_t j = 0; j < data.inputs.size(); ++j) {
       if (j) out << ',';
       out << data.inputs[j].size();

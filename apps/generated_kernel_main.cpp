@@ -14,6 +14,11 @@ bool emitGeneratedKernelContract(const tensor::metal::MetalRuntime &runtime,
     return false;
   }
   const auto contract = tensor::llm::makeKernelContract(pattern);
+  if(contract.storageType==tensor::metal::ElementType::BFloat16 &&
+     !runtime.hardwareInfo().supportsBFloat16) {
+    log << "Generated-kernel contract: FAIL\nNative bf16 unavailable; request an fp16 pattern.\n";
+    return false;
+  }
   const auto error = tensor::llm::writeKernelContract(runtime, contract, path);
   if (!error.empty()) {
     log << "Generated-kernel contract: FAIL\n"
@@ -23,7 +28,9 @@ bool emitGeneratedKernelContract(const tensor::metal::MetalRuntime &runtime,
   log << "Generated-kernel contract: PASS\n"
       << "Pattern: " << contract.pattern << '\n'
       << "Cases: " << contract.cases.size()
-      << ", fp32, outputs=" << contract.outputNames.size() << '\n'
+      << ", storage=" << (contract.storageType==tensor::metal::ElementType::Float16 ? "fp16" :
+                           contract.storageType==tensor::metal::ElementType::BFloat16 ? "bf16" : "fp32")
+      << ", outputs=" << contract.outputNames.size() << '\n'
       << "Contract file: " << path << '\n';
   return true;
 }
